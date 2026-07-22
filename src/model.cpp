@@ -116,38 +116,55 @@ void MoEModel::forward(int token_id, int pos, InferenceContext& ctx) {
         // Normalize the state
         ops::rms_norm(ctx.norm_buffer.data(), ctx.hidden_state.data(), 
                       static_cast<const float*>(layer_w.input_norm->data), 
-                      hidden_dim, config.norm_epsilon);
+                      config.hidden_dim, config.norm_epsilon);
                       
-        // Project Query, Key, and Value vectors
-        ops::matmul(ctx.q.data(), ctx.norm_buffer.data(), *layer_w.q_proj);
-        ops::matmul(ctx.k.data(), ctx.norm_buffer.data(), *layer_w.k_proj);
-        ops::matmul(ctx.v.data(), ctx.norm_buffer.data(), *layer_w.v_proj);
+        // 1. Query projection
+        // q_latent = norm_buffer * wq_a [q_lora_rank]
+        ops::matmul(ctx.q_latent.data(), ctx.norm_buffer.data(), *layer_w.wq_a);
+        // Normalize q_latent
+        ops::rms_norm(ctx.q_latent.data(), ctx.q_latent.data(), 
+                      static_cast<const float*>(layer_w.q_norm->data), 
+                      config.q_lora_rank, config.norm_epsilon);
+        // q = q_latent * wq_b [num_heads * head_dim]
+        ops::matmul(ctx.q.data(), ctx.q_latent.data(), *layer_w.wq_b);
         
-        // Apply Rotary Position Embeddings (RoPE)
-        ops::rope(ctx.q.data(), config.num_heads, config.head_dim, pos, config.rope_theta);
-        ops::rope(ctx.k.data(), config.num_heads, config.head_dim, pos, config.rope_theta);
+        // 2. Key-Value projection
+        // kv_latent = norm_buffer * wkv [kv_lora_rank]
+        ops::matmul(ctx.kv_latent.data(), ctx.norm_buffer.data(), *layer_w.wkv);
+        // Normalize kv_latent
+        ops::rms_norm(ctx.kv_latent.data(), ctx.kv_latent.data(), 
+                      static_cast<const float*>(layer_w.kv_norm->data), 
+                      config.kv_lora_rank, config.norm_epsilon);
         
-        // Store Key-Value states in Cache for future token lookups
-        float* layer_k_cache = ctx.k_cache[l].data() + (pos * hidden_dim);
-        float* layer_v_cache = ctx.v_cache[l].data() + (pos * hidden_dim);
-        std::memcpy(layer_k_cache, ctx.k.data(), hidden_dim * sizeof(float));
-        std::memcpy(layer_v_cache, ctx.v.data(), hidden_dim * sizeof(float));
+        // 3. Apply Decoupled RoPE
+        // RoPE is applied to the last 64 elements of each head's query, and the last 64 of kv_latent
+        for (int h = 0; h < config.num_heads; ++h) {
+            float* head_q_rope = ctx.q.data() + (h * config.head_dim) + (config.head_dim - config.rope_head_dim);
+            ops::rope(head_q_rope, 1, config.rope_head_dim, pos, config.rope_theta);
+        }
+        
+        float* kv_rope_ptr = ctx.kv_latent.data() + (config.head_dim - config.rope_head_dim);
+        ops::rope(kv_rope_ptr, 1, config.rope_head_dim, pos, config.rope_theta);
+        
+        // 4. Store KV latent state in Cache
+        float* layer_cache_ptr = ctx.kv_cache[l].data() + (pos * config.head_dim);
+        std::memcpy(layer_cache_ptr, ctx.kv_latent.data(), config.head_dim * sizeof(float));
         
         // Clear attention output buffer
         std::fill(ctx.attn_out.begin(), ctx.attn_out.end(), 0.0f);
         
-        // Compute scaled attention scores and weights
+        // 5. Compute scaled attention scores and weights (Direct Latent dot-product)
+        float scale_factor = 1.0f / std::sqrt(static_cast<float>(config.head_dim));
         for (int h = 0; h < config.num_heads; ++h) {
             float* head_scores = ctx.attn_scores.data() + (h * config.max_seq_len);
-            float scale_factor = 1.0f / std::sqrt(static_cast<float>(config.head_dim));
             const float* head_q = ctx.q.data() + (h * config.head_dim);
             
-            // Dot product between Q and past Keys
+            // Dot product between Query and past compressed KV states
             for (int p = 0; p <= pos; ++p) {
-                const float* cached_k = ctx.k_cache[l].data() + (p * hidden_dim) + (h * config.head_dim);
+                const float* cached_kv = ctx.kv_cache[l].data() + (p * config.head_dim);
                 float score = 0.0f;
                 for (int d = 0; d < config.head_dim; ++d) {
-                    score += head_q[d] * cached_k[d];
+                    score += head_q[d] * cached_kv[d];
                 }
                 head_scores[p] = score * scale_factor;
             }
@@ -155,21 +172,36 @@ void MoEModel::forward(int token_id, int pos, InferenceContext& ctx) {
             // Softmax over valid past token positions
             ops::softmax(head_scores, pos + 1);
             
-            // Multiply attention weights by Value vectors
+            // Multiply attention weights by KV latent vectors (reconstructing output)
             float* head_attn_out = ctx.attn_out.data() + (h * config.head_dim);
             for (int p = 0; p <= pos; ++p) {
                 float weight = head_scores[p];
-                const float* cached_v = ctx.v_cache[l].data() + (p * hidden_dim) + (h * config.head_dim);
+                const float* cached_kv = ctx.kv_cache[l].data() + (p * config.head_dim);
                 for (int d = 0; d < config.head_dim; ++d) {
-                    head_attn_out[d] += weight * cached_v[d];
+                    head_attn_out[d] += weight * cached_kv[d];
                 }
             }
         }
         
-        // Project Attention output back to hidden dimension and add residual
-        // hidden_state = hidden_state + (attn_out * o_proj)
-        ops::matmul(ctx.norm_buffer.data(), ctx.attn_out.data(), *layer_w.o_proj);
-        ops::vec_add(ctx.hidden_state.data(), ctx.norm_buffer.data(), hidden_dim);
+        // 6. Output Projection via Grouped Low-Rank
+        // We have 8 groups. Each group projects 8 heads (8 * 512 = 4096 dims) to 1024 latent dims.
+        std::vector<float> o_latent(8 * 1024, 0.0f);
+        for (int g = 0; g < 8; ++g) {
+            float* group_in = ctx.attn_out.data() + (g * 8 * config.head_dim); // 4096 dims
+            float* group_out = o_latent.data() + (g * 1024);
+            
+            // Slice wo_a: shape [8192, 4096]. Group g slice is [1024, 4096] at row offset g * 1024
+            Tensor wo_a_slice = *layer_w.wo_a;
+            wo_a_slice.shape = {1024, 8 * config.head_dim};
+            wo_a_slice.data = static_cast<char*>(layer_w.wo_a->data) + (g * 1024 * (8 * config.head_dim) * sizeof(float)); // Adjust offsets if quantized
+            
+            // If quantized, C++ GEMM handles it automatically because type is passed in the slice Tensor
+            ops::matmul(group_out, group_in, wo_a_slice);
+        }
+        
+        // Project back to hidden_dim (4096) via wo_b
+        ops::matmul(ctx.norm_buffer.data(), o_latent.data(), *layer_w.wo_b);
+        ops::vec_add(ctx.hidden_state.data(), ctx.norm_buffer.data(), config.hidden_dim);
         
         // ----------------------------------------------------
         // B. MoE MLP Block (Residual Connection)
