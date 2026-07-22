@@ -1,0 +1,11 @@
+bin/
+*.exe
+*.log
+scratch/chats/
+raw_model/
+model/
+D:/
+*.safetensors
+*.metadata
+*.lock
+*.incomplete
