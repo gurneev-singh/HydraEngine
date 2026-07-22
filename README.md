@@ -68,7 +68,23 @@ graph TD
     end
 
     RunExpert --> Accumulate["Accumulate (Routed + Shared Expert)"]
-    Accumulate --> Output["RMSNorm & LM Head Logits"]
+    Accumulate --> OutputHidden["Output Hidden State (Layer 42)"]
+    
+    subgraph SpecDec ["Speculative Decoding Branch"]
+        OutputHidden --> StandardPath["LM Head (Next-Token)"]
+        StandardPath --> Token1["Predict Token T(n+1)"]
+        
+        OutputHidden --> MTPBlock["MTP Block (Layer 43)"]
+        Token1 --> EmbedToken1["Embed Token T(n+1)"]
+        EmbedToken1 --> MTPBlock
+        MTPBlock --> MTP_Head["MTP LM Head"]
+        MTP_Head --> Token2["Predict Speculative Token T(n+2)"]
+        
+        Token1 --> Validate{"Speculative Verification"}
+        Token2 --> Validate
+        Validate -- "Match (Verify OK)" --> AcceptBoth["Accept both tokens (+2 speed)"]
+        Validate -- "Mismatch (Reject T(n+2))" --> AcceptOne["Fallback to T(n+1) (+1 speed)"]
+    end
 ```
 
 ---
