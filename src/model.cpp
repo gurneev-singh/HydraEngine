@@ -10,9 +10,11 @@
 // InferenceContext Implementation
 // ----------------------------------------------------
 void InferenceContext::resize(const ModelConfig& cfg) {
-    hidden_state.resize(cfg.num_heads * cfg.head_dim);
-    norm_buffer.resize(cfg.num_heads * cfg.head_dim);
+    hidden_state.resize(cfg.hidden_dim);
+    norm_buffer.resize(cfg.hidden_dim);
     
+    q_latent.resize(cfg.q_lora_rank);
+    kv_latent.resize(cfg.kv_lora_rank);
     q.resize(cfg.num_heads * cfg.head_dim);
     k.resize(cfg.num_heads * cfg.head_dim);
     v.resize(cfg.num_heads * cfg.head_dim);
@@ -21,18 +23,17 @@ void InferenceContext::resize(const ModelConfig& cfg) {
     attn_out.resize(cfg.num_heads * cfg.head_dim);
     
     router_logits.resize(cfg.num_experts);
-    expert_in.resize(cfg.num_heads * cfg.head_dim);
+    expert_in.resize(cfg.hidden_dim);
     
     expert_gate_out.resize(cfg.ffn_hidden_dim);
     expert_up_out.resize(cfg.ffn_hidden_dim);
-    expert_down_out.resize(cfg.num_heads * cfg.head_dim);
-    layer_mlp_out.resize(cfg.num_heads * cfg.head_dim);
+    expert_down_out.resize(cfg.hidden_dim);
+    layer_mlp_out.resize(cfg.hidden_dim);
     
     logits.resize(cfg.vocab_size);
     
-    // Allocate space for KV cache
-    k_cache.resize(cfg.num_layers, std::vector<float>(cfg.max_seq_len * cfg.num_heads * cfg.head_dim, 0.0f));
-    v_cache.resize(cfg.num_layers, std::vector<float>(cfg.max_seq_len * cfg.num_heads * cfg.head_dim, 0.0f));
+    // Allocate space for MLA KV cache: 512 latent dimensions + 64 RoPE dimensions = 576 per token.
+    kv_cache.resize(cfg.num_layers, std::vector<float>(cfg.max_seq_len * (cfg.kv_lora_rank + cfg.rope_head_dim), 0.0f));
 }
 
 // ----------------------------------------------------
@@ -43,47 +44,53 @@ MoEModel::MoEModel(const ModelConfig& cfg, const std::string& model_dir)
     
     // Instantiate our custom paging expert cache manager
     std::string experts_path = model_directory + "/experts";
-    expert_cache = std::make_shared<ExpertCache>(experts_path, 128); // Increased capacity to 128 for real model
+    expert_cache = std::make_shared<ExpertCache>(experts_path, 128);
 }
 
 bool MoEModel::load_base_model() {
-    std::string base_path = model_directory + "/base.safetensors";
-    base_file = std::make_shared<SafetensorsFile>(base_path);
+    std::string meta_path = model_directory + "/base_meta.safetensors";
+    meta_file = std::make_shared<SafetensorsFile>(meta_path);
     
-    if (!base_file->parse_header()) {
-        std::cerr << "[Error] Failed to load base weights from: " << base_path << std::endl;
+    if (!meta_file->parse_header()) {
+        std::cerr << "[Error] Failed to load metadata weights from: " << meta_path << std::endl;
         return false;
     }
     
-    std::cout << "[Model Loading] Mapping permanent base tensors..." << std::endl;
+    std::cout << "[Model Loading] Mapping permanent base metadata tensors..." << std::endl;
     
     // Map permanent vocabulary embeddings and output weights
-    token_embeddings = base_file->map_tensor("model.embed_tokens.weight");
-    output_norm = base_file->map_tensor("model.norm.weight");
-    lm_head = base_file->map_tensor("lm_head.weight");
+    token_embeddings = meta_file->map_tensor("embed.weight");
+    output_norm = meta_file->map_tensor("norm.weight");
+    lm_head = meta_file->map_tensor("lm_head.weight");
     
     // Pre-allocate and map per-layer base weights
     layers.resize(config.num_layers);
     for (int l = 0; l < config.num_layers; ++l) {
-        std::stringstream ss_in, ss_post, ss_q, ss_k, ss_v, ss_o, ss_gate;
+        std::stringstream ss_path;
+        ss_path << model_directory << "/base_layer_" << l << ".safetensors";
         
-        ss_in << "model.layers." << l << ".input_layernorm.weight";
-        ss_post << "model.layers." << l << ".post_attention_layernorm.weight";
-        ss_q << "model.layers." << l << ".self_attn.q_proj.weight";
-        ss_k << "model.layers." << l << ".self_attn.k_proj.weight";
-        ss_v << "model.layers." << l << ".self_attn.v_proj.weight";
-        ss_o << "model.layers." << l << ".self_attn.o_proj.weight";
-        ss_gate << "model.layers." << l << ".mlp.gate.weight"; // Router gate
+        layers[l].layer_file = std::make_shared<SafetensorsFile>(ss_path.str());
+        if (!layers[l].layer_file->parse_header()) {
+            std::cerr << "[Error] Failed to parse layer " << l << " weights from: " << ss_path.str() << std::endl;
+            return false;
+        }
         
-        layers[l].input_norm = base_file->map_tensor(ss_in.str());
-        layers[l].post_attention_norm = base_file->map_tensor(ss_post.str());
+        layers[l].input_norm = layers[l].layer_file->map_tensor("input_layernorm.weight");
+        layers[l].post_attention_norm = layers[l].layer_file->map_tensor("post_attention_layernorm.weight");
+        layers[l].q_norm = layers[l].layer_file->map_tensor("self_attn.q_norm.weight");
+        layers[l].kv_norm = layers[l].layer_file->map_tensor("self_attn.kv_norm.weight");
         
-        layers[l].q_proj = base_file->map_tensor(ss_q.str());
-        layers[l].k_proj = base_file->map_tensor(ss_k.str());
-        layers[l].v_proj = base_file->map_tensor(ss_v.str());
-        layers[l].o_proj = base_file->map_tensor(ss_o.str());
+        layers[l].wq_a = layers[l].layer_file->map_tensor("self_attn.wq_a.weight");
+        layers[l].wq_b = layers[l].layer_file->map_tensor("self_attn.wq_b.weight");
+        layers[l].wkv = layers[l].layer_file->map_tensor("self_attn.wkv.weight");
+        layers[l].wo_a = layers[l].layer_file->map_tensor("self_attn.wo_a.weight");
+        layers[l].wo_b = layers[l].layer_file->map_tensor("self_attn.wo_b.weight");
         
-        layers[l].router_gate = base_file->map_tensor(ss_gate.str());
+        layers[l].shared_gate = layers[l].layer_file->map_tensor("ffn.shared_experts.gate_proj.weight");
+        layers[l].shared_up = layers[l].layer_file->map_tensor("ffn.shared_experts.up_proj.weight");
+        layers[l].shared_down = layers[l].layer_file->map_tensor("ffn.shared_experts.down_proj.weight");
+        
+        layers[l].router_gate = layers[l].layer_file->map_tensor("ffn.gate.weight");
     }
     
     std::cout << "[Model Loading] Base model tensors mapped successfully." << std::endl;
