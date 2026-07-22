@@ -17,7 +17,7 @@ struct BlockQ4_0 {
 struct BlockQ2 {
     float d;          // scale factor (delta)
     float min;        // minimum bias value
-    uint8_t qs[8];    // 32 packed 2-bit weights (4 values per byte, 4 * 8 = 32)
+    uint8_t qs[64];   // 256 packed 2-bit weights (4 values per byte, 4 * 64 = 256)
 };
 
 namespace ops {
@@ -159,7 +159,7 @@ namespace ops {
         // Case C: 2-Bit Quantized weights (Q2_K) - Used for MoE experts
         else if (w.type == DataType::Q2_K) {
             const BlockQ2* w_blocks = static_cast<const BlockQ2*>(w.data);
-            int blocks_per_row = cols / 32;
+            int blocks_per_row = cols / 256;
             
             for (int r = 0; r < rows; ++r) {
                 float sum = 0.0f;
@@ -168,10 +168,10 @@ namespace ops {
                 for (int b = 0; b < blocks_per_row; ++b) {
                     const BlockQ2& block = row_blocks[b];
                     float block_sum = 0.0f;
-                    int x_offset = b * 32;
+                    int x_offset = b * 256;
                     
-                    // Decode 32 packed 2-bit values (4 values per byte)
-                    for (int i = 0; i < 32; ++i) {
+                    // Decode 256 packed 2-bit values (4 values per byte)
+                    for (int i = 0; i < 256; ++i) {
                         int byte_idx = i / 4;
                         int bit_shift = (i % 4) * 2;
                         
