@@ -98,7 +98,7 @@ bool MoEModel::load_base_model() {
 }
 
 void MoEModel::forward(int token_id, int pos, InferenceContext& ctx) {
-    int hidden_dim = config.num_heads * config.head_dim;
+    int hidden_dim = config.hidden_dim;
     
     // 1. Embedding lookup
     // copy row from embedding table: token_embeddings[token_id, :] -> ctx.hidden_state
@@ -209,7 +209,7 @@ void MoEModel::forward(int token_id, int pos, InferenceContext& ctx) {
         // Normalize state before MLP FFN
         ops::rms_norm(ctx.norm_buffer.data(), ctx.hidden_state.data(), 
                       static_cast<const float*>(layer_w.post_attention_norm->data), 
-                      hidden_dim, config.norm_epsilon);
+                      config.hidden_dim, config.norm_epsilon);
                       
         // Get logits from Router Gate: router_logits = norm_buffer * router_gate
         ops::matmul(ctx.router_logits.data(), ctx.norm_buffer.data(), *layer_w.router_gate);
@@ -233,7 +233,7 @@ void MoEModel::forward(int token_id, int pos, InferenceContext& ctx) {
         // Clear layer FFN output accumulator
         std::fill(ctx.layer_mlp_out.begin(), ctx.layer_mlp_out.end(), 0.0f);
         
-        // Run active experts
+        // 1. Run 6 active routed experts
         for (int k = 0; k < config.num_active_experts; ++k) {
             float route_prob = expert_scores[k].first / sum_probs;
             int expert_id = expert_scores[k].second;
@@ -242,32 +242,46 @@ void MoEModel::forward(int token_id, int pos, InferenceContext& ctx) {
             auto expert = expert_cache->get_expert(l, expert_id);
             if (!expert) continue;
             
-            // 1. Gate projection: gate_out = norm_buffer * gate_proj
-            if (expert->gate_proj) {
-                ops::matmul(ctx.expert_gate_out.data(), ctx.norm_buffer.data(), *expert->gate_proj);
-                ops::silu(ctx.expert_gate_out.data(), ctx.expert_gate_out.data(), config.ffn_hidden_dim);
-            } else {
-                // If model has no gate layer, default to zeros
-                std::fill(ctx.expert_gate_out.begin(), ctx.expert_gate_out.end(), 1.0f);
-            }
+            // Gate projection: gate_out = norm_buffer * gate_proj
+            ops::matmul(ctx.expert_gate_out.data(), ctx.norm_buffer.data(), *expert->gate_proj);
+            ops::silu(ctx.expert_gate_out.data(), ctx.expert_gate_out.data(), config.ffn_hidden_dim);
             
-            // 2. Up projection: up_out = norm_buffer * up_proj
+            // Up projection: up_out = norm_buffer * up_proj
             ops::matmul(ctx.expert_up_out.data(), ctx.norm_buffer.data(), *expert->up_proj);
             
-            // 3. Activation gating: gate_out = gate_out * up_out
+            // Activation gating: gate_out = gate_out * up_out
             ops::vec_mul(ctx.expert_gate_out.data(), ctx.expert_up_out.data(), config.ffn_hidden_dim);
             
-            // 4. Down projection: down_out = gate_out * down_proj
+            // Down projection: down_out = gate_out * down_proj
             ops::matmul(ctx.expert_down_out.data(), ctx.expert_gate_out.data(), *expert->down_proj);
             
-            // 5. Accumulate scaled expert output: layer_mlp_out += down_out * route_prob
-            for (int d = 0; d < hidden_dim; ++d) {
+            // Accumulate scaled expert output: layer_mlp_out += down_out * route_prob
+            for (int d = 0; d < config.hidden_dim; ++d) {
                 ctx.layer_mlp_out[d] += ctx.expert_down_out[d] * route_prob;
             }
         }
         
-        // Add MLP output back to hidden state (residual connection)
-        ops::vec_add(ctx.hidden_state.data(), ctx.layer_mlp_out.data(), hidden_dim);
+        // 2. Run 1 always-active shared expert
+        // Gate projection: shared_gate_out = norm_buffer * shared_gate
+        ops::matmul(ctx.expert_gate_out.data(), ctx.norm_buffer.data(), *layer_w.shared_gate);
+        ops::silu(ctx.expert_gate_out.data(), ctx.expert_gate_out.data(), config.ffn_hidden_dim);
+        
+        // Up projection: shared_up_out = norm_buffer * shared_up
+        ops::matmul(ctx.expert_up_out.data(), ctx.norm_buffer.data(), *layer_w.shared_up);
+        
+        // Activation gating: shared_gate_out = shared_gate_out * shared_up_out
+        ops::vec_mul(ctx.expert_gate_out.data(), ctx.expert_up_out.data(), config.ffn_hidden_dim);
+        
+        // Down projection: shared_down_out = shared_gate_out * shared_down
+        ops::matmul(ctx.expert_down_out.data(), ctx.expert_gate_out.data(), *layer_w.shared_down);
+        
+        // Accumulate shared expert output: layer_mlp_out += shared_down_out
+        for (int d = 0; d < config.hidden_dim; ++d) {
+            ctx.layer_mlp_out[d] += ctx.expert_down_out[d];
+        }
+        
+        // Add FFN output back to hidden state (residual connection)
+        ops::vec_add(ctx.hidden_state.data(), ctx.layer_mlp_out.data(), config.hidden_dim);
     }
     
     // 3. Final Output Projections
