@@ -6,33 +6,34 @@
 
 int main(int argc, char* argv[]) {
     std::cout << "==================================================" << std::endl;
-    std::cout << " Qwen3.6-35B-A3B C++ Inference Diagnostics" << std::endl;
+    std::cout << "          HydraEngine C++ Inference Diagnostics" << std::endl;
     std::cout << "==================================================" << std::endl;
 
-    std::string model_dir = "D:/qwen_sharded";
+    std::string model_dir = "D:/deepseek_sharded";
     if (argc > 1) {
         model_dir = argv[1];
     }
 
-    // 1. Configure ModelConfig to match Qwen3.6-35B-A3B exactly
+    // 1. Configure ModelConfig to match DeepSeek-V4-Flash exactly
     ModelConfig cfg;
-    cfg.num_layers = 40;
-    cfg.num_heads = 16;
-    cfg.head_dim = 256;          // hidden_dim = 16 * 128 = 2048 (Attention head dim)
-    cfg.hidden_dim = 2048;
-    cfg.ffn_hidden_dim = 512;
-    cfg.vocab_size = 248320;
+    cfg.num_layers = 43;
+    cfg.num_heads = 64;
+    cfg.head_dim = 512;
+    cfg.hidden_dim = 4096;
+    cfg.ffn_hidden_dim = 2048;
+    cfg.vocab_size = 129280;
     cfg.num_experts = 256;
-    cfg.num_active_experts = 8;
+    cfg.num_active_experts = 6;
     cfg.norm_epsilon = 1e-6f;
-    cfg.rope_theta = 1000000.0f;
-    cfg.max_seq_len = 512;
+    cfg.rope_theta = 10000.0f;
+    cfg.max_seq_len = 4096;
 
-    std::cout << "Initializing Qwen MoE Model..." << std::endl;
+    std::cout << "Initializing HydraEngine MoE Model..." << std::endl;
     std::cout << "- Model Directory: " << model_dir << std::endl;
     std::cout << "- Layers: " << cfg.num_layers << std::endl;
     std::cout << "- Heads: " << cfg.num_heads << " (dim " << cfg.head_dim << ")" << std::endl;
-    std::cout << "- Experts per layer: " << cfg.num_experts << " (active " << cfg.num_active_experts << ")" << std::endl;
+    std::cout << "- Routed Experts per layer: " << cfg.num_experts << " (active " << cfg.num_active_experts << ")" << std::endl;
+    std::cout << "- Shared Experts per layer: 1" << std::endl;
     std::cout << "- Vocab Size: " << cfg.vocab_size << std::endl << std::endl;
 
     MoEModel model(cfg, model_dir);
