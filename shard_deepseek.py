@@ -76,6 +76,36 @@ def quantize_q4_0(f32_arr):
     packed['qs'] = packed_qs
     return packed.tobytes()
 
+# Helper to quantize Float32 to Q2_K block format (2-bit weights, block size 32)
+def quantize_q2_k(f32_arr):
+    size = f32_arr.size
+    remainder = size % 32
+    if remainder != 0:
+        padding = 32 - remainder
+        f32_arr = np.concatenate([f32_arr, np.zeros(padding, dtype=np.float32)])
+        
+    blocks = f32_arr.reshape(-1, 32)
+    min_vals = np.min(blocks, axis=1)
+    max_vals = np.max(blocks, axis=1)
+    ranges = max_vals - min_vals
+    scales = ranges / 3.0
+    scales = np.where(scales == 0.0, 1e-5, scales)
+    
+    q_vals = np.round((blocks - min_vals[:, np.newaxis]) / scales[:, np.newaxis])
+    q_vals = np.clip(q_vals, 0, 3).astype(np.uint8)
+    
+    q_grouped = q_vals.reshape(-1, 8, 4)
+    packed_qs = np.zeros((q_grouped.shape[0], 8), dtype=np.uint8)
+    for i in range(4):
+        packed_qs |= (q_grouped[:, :, i] << (2 * i))
+        
+    block_type = np.dtype([('d', '<f4'), ('min', '<f4'), ('qs', 'u1', (8,))])
+    packed = np.zeros(blocks.shape[0], dtype=block_type)
+    packed['d'] = scales
+    packed['min'] = min_vals
+    packed['qs'] = packed_qs
+    return packed.tobytes()
+
 # Write safetensors file
 # Temporary directory for disk-based tensor staging to prevent RAM exhaustion
 TEMP_DIR = "D:/deepseek_sharded/temp_base"
@@ -220,8 +250,8 @@ for idx, filename in enumerate(raw_files):
                     # Dequantize
                     f32_weight = dequantize_weight_and_scale(w_bytes, s_bytes, meta_w["shape"], meta_s["shape"])
                     
-                    # Quantize to Q4_0
-                    q4_bytes = quantize_q4_0(f32_weight)
+                    # Quantize to Q2_K
+                    q2_bytes = quantize_q2_k(f32_weight)
                     
                     # Write to expert file
                     exp_file_name = f"expert_{layer_id}_{expert_id}.safetensors"
@@ -242,7 +272,7 @@ for idx, filename in enumerate(raw_files):
                     
                     # Map to standard projection names
                     proj_map = {"w1": "gate_proj.weight", "w2": "down_proj.weight", "w3": "up_proj.weight"}
-                    existing[proj_map[w_id]] = (meta_w["shape"], "Q4_0", q4_bytes)
+                    existing[proj_map[w_id]] = (meta_w["shape"], "Q2_K", q2_bytes)
                     
                     write_safetensors(exp_file_path, existing)
                     
