@@ -77,20 +77,35 @@ def quantize_q4_0(f32_arr):
     return packed.tobytes()
 
 # Write safetensors file
+# Temporary directory for disk-based tensor staging to prevent RAM exhaustion
+TEMP_DIR = "D:/deepseek_sharded/temp_base"
+os.makedirs(TEMP_DIR, exist_ok=True)
+
+def stage_tensor(name, data_bytes):
+    safe_name = name.replace(".", "_").replace("/", "_")
+    path = os.path.join(TEMP_DIR, f"{safe_name}.bin")
+    with open(path, "wb") as f:
+        f.write(data_bytes)
+    return path
+
+# Write safetensors file
 def write_safetensors(file_path, tensors):
     header = {}
     current_offset = 0
-    raw_data = bytearray()
     
-    for name, (shape, dtype_str, data_bytes) in tensors.items():
+    for name, (shape, dtype_str, path_or_bytes) in tensors.items():
+        if isinstance(path_or_bytes, str):
+            data_len = os.path.getsize(path_or_bytes)
+        else:
+            data_len = len(path_or_bytes)
+            
         start = current_offset
-        end = start + len(data_bytes)
+        end = start + data_len
         header[name] = {
             "dtype": dtype_str,
             "shape": shape,
             "data_offsets": [start, end]
         }
-        raw_data.extend(data_bytes)
         current_offset = end
         
     header["__metadata__"] = {"format": "pt"}
@@ -103,7 +118,15 @@ def write_safetensors(file_path, tensors):
     with open(file_path, "wb") as f:
         f.write(struct.pack("<Q", len(header_json)))
         f.write(header_json)
-        f.write(raw_data)
+        
+        # Stream data chunk by chunk to prevent loading everything into RAM
+        for name, (shape, dtype_str, path_or_bytes) in tensors.items():
+            if isinstance(path_or_bytes, str):
+                with open(path_or_bytes, "rb") as temp_f:
+                    while chunk := temp_f.read(16 * 1024 * 1024): # 16 MB chunk size
+                        f.write(chunk)
+            else:
+                f.write(path_or_bytes)
 
 # Find raw partition files
 raw_files = sorted([f for f in os.listdir(D_DIR) if f.endswith(".safetensors")])
@@ -247,7 +270,7 @@ for idx, filename in enumerate(raw_files):
                         layer_buffers[layer_id] = {}
                     
                     proj_map = {"w1": "ffn.shared_experts.gate_proj.weight", "w2": "ffn.shared_experts.down_proj.weight", "w3": "ffn.shared_experts.up_proj.weight"}
-                    layer_buffers[layer_id][proj_map[w_id]] = (meta_w["shape"], "Q8_0", q8_bytes)
+                    layer_buffers[layer_id][proj_map[w_id]] = (meta_w["shape"], "Q8_0", stage_tensor(f"layer_{layer_id}_{w_id}_shared", q8_bytes))
                     
                     processed_keys.add(name)
                     processed_keys.add(scale_name)
@@ -273,7 +296,7 @@ for idx, filename in enumerate(raw_files):
                         layer_buffers[layer_id] = {}
                         
                     cpp_name = f"self_attn.{proj_name}.weight"
-                    layer_buffers[layer_id][cpp_name] = (meta_w["shape"], "Q8_0", q8_bytes)
+                    layer_buffers[layer_id][cpp_name] = (meta_w["shape"], "Q8_0", stage_tensor(f"layer_{layer_id}_{proj_name}", q8_bytes))
                     
                     processed_keys.add(name)
                     processed_keys.add(scale_name)
@@ -295,17 +318,17 @@ for idx, filename in enumerate(raw_files):
                     # Convert BF16 1D weights to Float32
                     if meta["dtype"] == "BF16":
                         f32_arr = convert_bf16_to_f32(data_bytes)
-                        layer_buffers[layer_id][sub_name] = (meta["shape"], "F32", f32_arr.tobytes())
+                        layer_buffers[layer_id][sub_name] = (meta["shape"], "F32", stage_tensor(f"layer_{layer_id}_{sub_name}", f32_arr.tobytes()))
                     else:
-                        layer_buffers[layer_id][sub_name] = (meta["shape"], meta["dtype"], data_bytes)
+                        layer_buffers[layer_id][sub_name] = (meta["shape"], meta["dtype"], stage_tensor(f"layer_{layer_id}_{sub_name}", data_bytes))
                 
                 else:
                     # Global metadata (embed.weight, lm_head.weight, norm.weight)
                     if meta["dtype"] == "BF16":
                         f32_arr = convert_bf16_to_f32(data_bytes)
-                        meta_tensors[name] = (meta["shape"], "F32", f32_arr.tobytes())
+                        meta_tensors[name] = (meta["shape"], "F32", stage_tensor(f"meta_{name}", f32_arr.tobytes()))
                     else:
-                        meta_tensors[name] = (meta["shape"], meta["dtype"], data_bytes)
+                        meta_tensors[name] = (meta["shape"], meta["dtype"], stage_tensor(f"meta_{name}", data_bytes))
                 
                 processed_keys.add(name)
         
@@ -329,6 +352,13 @@ for layer_id, tensors in layer_buffers.items():
     layer_file = f"base_layer_{layer_id}.safetensors"
     print(f"  Writing {layer_file}...")
     write_safetensors(os.path.join(OUT_DIR, layer_file), tensors)
+
+# Cleanup temporary staging directory
+import shutil
+print("\nCleaning up temporary disk-staging directory...")
+if os.path.exists(TEMP_DIR):
+    shutil.rmtree(TEMP_DIR)
+print("Cleanup complete.")
 
 print("\n==================================================")
 print(" Sharding and Quantization Completed Successfully!")
