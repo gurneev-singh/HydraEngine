@@ -240,7 +240,7 @@ for idx, filename in enumerate(raw_files):
                     w_bytes = mmapped_file[header_offset + meta_w["data_offsets"][0] : header_offset + meta_w["data_offsets"][1]]
                     s_bytes = mmapped_file[header_offset + meta_s["data_offsets"][0] : header_offset + meta_s["data_offsets"][1]]
                     
-                    f32_weight = dequantize_weight_and_scale(w_bytes, s_bytes, meta_w["shape"], meta_s["shape"])
+                    f32_weight = dequantize_fp8_weight_and_scale(w_bytes, s_bytes, meta_w["shape"], meta_s["shape"])
                     q8_bytes = quantize_q8_0(f32_weight)
                     
                     if layer_id not in layer_buffers:
