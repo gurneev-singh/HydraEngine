@@ -97,13 +97,11 @@ Instead of caching massive, full-rank Key and Value states ($64 \text{ heads} \t
 
 The attention weights are computed directly in this compressed space:
 $$S_{h, p} = Q_{h} \cdot KV_{p}^T = \sum_{d=0}^{511} Q_{h}[d] \times KV_{p}[d]$$
-This achieves a **57x reduction** in KV Cache size without losing positional or representational accuracy.
-
-### 2. Zipfian RAM Caching
+This achieves a **57x reduction** in KV Cache size without losing positional or representationa### 2. Zipfian RAM Caching
 Expert routing in large MoE models follows a power-law distribution (Zipf's Law): a small subset of "hot" experts are selected for almost 80% of all tokens in a natural conversation. 
-HydraEngine utilizes an **LRU (Least Recently Used) Paging Cache** for the 256 routed experts:
+HydraEngine utilizes an **LRU (Least Recently Used) Paging Cache** for the routed experts:
 * Base layers and embeddings are permanently loaded in memory.
-* The 11,008 routed experts (quantized to **Q4_0** at just **7.08 MB** each) are loaded dynamically.
+* The 10,752 routed experts (quantized to **Q2_K** at just **~6.68 MB** each) are loaded dynamically.
 * If an expert is in the LRU Cache, it is reused instantly (**Cache Hit**).
 * If a Cache Miss occurs, the oldest inactive expert is unmapped from RAM, and the new expert is memory-mapped from NVMe SSD on-the-fly.
 
@@ -115,26 +113,40 @@ DeepSeek-V4 natively trains with a **Multi-Token Prediction (MTP)** block (locat
 
 ---
 
-## 📂 File Layout
+## 🎓 Developer's Note & Hardware Limitations
+I am an individual student developer working on a consumer laptop (8GB RAM). Because of this, I do not have the high-end GPU clusters or massive server hardware necessary to run, shard, and evaluate ultra-scale models like **GLM-5.2 (744B parameters)** or **Kimi-K3 (2.8T parameters)** locally.
+
+To keep the repository organized and allow development on different architectures, I have separated the project into three self-contained directories. The GLM and Kimi folders are provided as clean C++ implementation shells. 
+> [!NOTE]
+> If you have the hardware resources, community contributions to complete the weights mapping and execution graphs for these models are highly welcome! PRs are always open!
+
+---
+
+## 📂 Repository File Layout
 
 ```
 HydraEngine/
-├── src/
-│   ├── tensor.h / tensor.cpp        # Zero-dependency Safetensors parser & memory mapper
-│   ├── cache.h / cache.cpp          # Virtual LRU paging expert cache
-│   ├── ops.h / ops.cpp              # Highly optimized mixed-precision GEMM math kernels
-│   ├── model.h / model.cpp          # MLA execution graph and layer forward passes
-│   ├── tokenizer.h / tokenizer.cpp  # hex/text token encoder & decoder
-│   └── main.cpp                     # HydraEngine CLI execution entry point
-├── shard_deepseek.py                # Python weight sharding and Q4_0 quantizer
-├── verify_shards.py                 # Diagnostic script to check sharded weights integrity
-├── build.ps1                        # Windows compiler automation script
-└── LICENSE                          # Proprietary non-commercial terms
+├── deepseek-v4/                  # Self-contained project for DeepSeek-V4-Flash
+│   ├── src/                      # C++ source code with full DeepSeek-V4 graph
+│   ├── build.ps1                 # Windows compiler script
+│   └── ...
+├── glm-5.2/                      # C++ project template shell for GLM-5.2
+│   ├── src/                      # Clean model shell (placeholders)
+│   ├── build.ps1
+│   └── ...
+├── kimi-k3/                      # C++ project template shell for Kimi-K3
+│   ├── src/                      # Clean model shell (placeholders)
+│   ├── build.ps1
+│   └── ...
+├── shard_deepseek.py             # Python weight sharder & Q2_K quantizer
+├── verify_shards.py              # Diagnostic script to check sharded weights integrity
+├── README.md                     # Main documentation
+└── LICENSE                       # Non-commercial terms
 ```
 
 ---
 
-## 🛠️ Step-by-Step Setup
+## 🛠️ Step-by-Step Setup (DeepSeek-V4-Flash)
 
 ### Step 1: Weight Sharding & Quantization
 Download the model weights from Hugging Face (`deepseek-ai/DeepSeek-V4-Flash`) into `D:/deepseek_raw` and execute the pipeline:
@@ -142,8 +154,8 @@ Download the model weights from Hugging Face (`deepseek-ai/DeepSeek-V4-Flash`) i
 python shard_deepseek.py
 ```
 This script performs a single-pass extraction:
-1. Dequantizes base attention layer weights and saves them layer-by-layer as Q8_0 binaries (`base_layer_{0..42}.safetensors`).
-2. Quantizes all 11,008 routed experts to Q4_0 format, saving them as individual files (`expert_{layer}_{expert}.safetensors` at ~7.08 MB each).
+1. Dequantizes base attention layer weights and saves them layer-by-layer as **8-bit (Q8_0)** binaries (`base_layer_{0..42}.safetensors`).
+2. Quantizes all 10,752 routed experts to **2-bit (Q2_K)** format with **block size 256** (at just **~6.68 MB** each), saving them inside `experts/expert_{layer}_{expert}.safetensors`. This compresses the entire model footprint to **under 80 GB total**!
 3. Generates the vocabulary lookup files (`vocab.txt`).
 
 ### Step 2: Verification
@@ -153,23 +165,27 @@ python verify_shards.py
 ```
 
 ### Step 3: Compilation
-Compile the zero-dependency C++ executable:
+Navigate to the directory of the model you want to run (e.g. `deepseek-v4/`) and compile:
 * **Windows (via build.ps1):**
   ```powershell
+  cd deepseek-v4
   powershell -ExecutionPolicy Bypass -File build.ps1
   ```
 * **Linux (GCC):**
   ```bash
+  cd deepseek-v4
   g++ -O3 -std=c++17 src/*.cpp -o bin/hydraengine
   ```
 
 ### Step 4: Run Inference
 Provide your prompt directly to the engine:
 ```bash
+# Windows
+./bin/moe_cache_test.exe "D:/deepseek_sharded" "Hello! How can I help you today?"
+
+# Linux
 ./bin/hydraengine "D:/deepseek_sharded" "Hello! How can I help you today?"
 ```
-
----
 
 ## 🔒 License
 
