@@ -7,5 +7,14 @@ model/
 D:/
 *.safetensors
 *.metadata
-*.lock
 *.incomplete
+*.lock
+
+# Helper scratch scripts
+download_model.py
+download_qwen.py
+download_qwen_base.py
+extract_vocab.py
+generate_mock_moe.py
+install_compiler.py
+shard_moe.py
