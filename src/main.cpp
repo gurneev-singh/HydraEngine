@@ -1,8 +1,12 @@
 #include "model.h"
 #include "tokenizer.h"
+#include "models/deepseek_v4.h"
+#include "models/glm_5_2.h"
+#include "models/kimi_k3.h"
 #include <iostream>
 #include <vector>
 #include <algorithm>
+#include <memory>
 
 int main(int argc, char* argv[]) {
     std::cout << "==================================================" << std::endl;
@@ -12,6 +16,16 @@ int main(int argc, char* argv[]) {
     std::string model_dir = "D:/deepseek_sharded";
     if (argc > 1) {
         model_dir = argv[1];
+    }
+
+    std::string prompt = "Hello";
+    if (argc > 2) {
+        prompt = argv[2];
+    }
+
+    std::string model_type = "deepseek";
+    if (argc > 3) {
+        model_type = argv[3];
     }
 
     // 1. Configure ModelConfig to match DeepSeek-V4-Flash exactly
@@ -30,17 +44,28 @@ int main(int argc, char* argv[]) {
 
     std::cout << "Initializing HydraEngine MoE Model..." << std::endl;
     std::cout << "- Model Directory: " << model_dir << std::endl;
+    std::cout << "- Model Type: " << model_type << std::endl;
     std::cout << "- Layers: " << cfg.num_layers << std::endl;
     std::cout << "- Heads: " << cfg.num_heads << " (dim " << cfg.head_dim << ")" << std::endl;
     std::cout << "- Routed Experts per layer: " << cfg.num_experts << " (active " << cfg.num_active_experts << ")" << std::endl;
     std::cout << "- Shared Experts per layer: 1" << std::endl;
     std::cout << "- Vocab Size: " << cfg.vocab_size << std::endl << std::endl;
 
-    MoEModel model(cfg, model_dir);
+    std::unique_ptr<MoEModel> model;
+    if (model_type == "deepseek") {
+        model = std::make_unique<DeepSeekV4Model>(cfg, model_dir);
+    } else if (model_type == "glm") {
+        model = std::make_unique<GLM52Model>(cfg, model_dir);
+    } else if (model_type == "kimi") {
+        model = std::make_unique<KimiK3Model>(cfg, model_dir);
+    } else {
+        std::cerr << "[Error] Unknown model type: " << model_type << std::endl;
+        return 1;
+    }
 
     // 2. Load the base safetensors
-    if (!model.load_base_model()) {
-        std::cerr << "[Error] Failed to load base weights from base.safetensors" << std::endl;
+    if (!model->load_base_model()) {
+        std::cerr << "[Error] Failed to load base weights" << std::endl;
         return 1;
     }
 
@@ -58,12 +83,6 @@ int main(int argc, char* argv[]) {
     InferenceContext ctx;
     ctx.resize(cfg);
 
-    // 5. User prompt and encoding
-    std::string prompt = "Hello";
-    if (argc > 2) {
-        prompt = argv[2];
-    }
-    
     std::cout << "\nEncoding Prompt: \"" << prompt << "\"" << std::endl;
     std::vector<int> tokens = tokenizer.encode(prompt);
     std::cout << "Tokens: ";
@@ -81,11 +100,10 @@ int main(int argc, char* argv[]) {
     for (; pos < static_cast<int>(tokens.size()); ++pos) {
         int token_id = tokens[pos];
         std::cout << "Processing token pos " << pos << " (ID: " << token_id << ")" << std::endl;
-        model.forward(token_id, pos, ctx);
+        model->forward(token_id, pos, ctx);
     }
 
     // Generate the next token
-    // Find the argmax (index of highest logit value)
     int next_token_id = 0;
     float max_logit = ctx.logits[0];
     for (int i = 1; i < cfg.vocab_size; ++i) {

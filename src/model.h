@@ -59,63 +59,16 @@ struct InferenceContext {
     void resize(const ModelConfig& cfg);
 };
 
-// Represents the complete Mixture of Experts Transformer model
+// Base class representing the Mixture of Experts Model interface
 class MoEModel {
 public:
-    ModelConfig config;
-    
-    MoEModel(const ModelConfig& cfg, const std::string& model_dir);
-    ~MoEModel() = default;
+    virtual ~MoEModel() = default;
     
     // Loads the base model weights (attention, routers, output embeddings)
-    bool load_base_model();
+    virtual bool load_base_model() = 0;
     
     // Runs a single forward pass of the model for a token at a specific position
-    void forward(int token_id, int pos, InferenceContext& ctx);
-
-private:
-    std::string model_directory;
-    
-    // Base weight file handler for global metadata
-    std::shared_ptr<SafetensorsFile> meta_file;
-    
-    // Expert cache pager
-    std::shared_ptr<ExpertCache> expert_cache;
-    
-    // ----------------------------------------------------
-    // Permanent Base Tensors (loaded in memory)
-    // ----------------------------------------------------
-    std::shared_ptr<Tensor> token_embeddings; // [vocab_size, hidden_dim]
-    std::shared_ptr<Tensor> output_norm;      // [hidden_dim]
-    std::shared_ptr<Tensor> lm_head;          // [vocab_size, hidden_dim]
-    
-    // Per-layer base weights
-    struct LayerBaseWeights {
-        // Layer-specific file handler
-        std::shared_ptr<SafetensorsFile> layer_file;
-
-        std::shared_ptr<Tensor> input_norm;             // [hidden_dim]
-        std::shared_ptr<Tensor> post_attention_norm;    // [hidden_dim]
-        std::shared_ptr<Tensor> q_norm;                 // [q_lora_rank]
-        std::shared_ptr<Tensor> kv_norm;                // [kv_lora_rank]
-        
-        // Attention weights
-        std::shared_ptr<Tensor> wq_a;                   // [q_lora_rank, hidden_dim]
-        std::shared_ptr<Tensor> wq_b;                   // [num_heads * head_dim, q_lora_rank]
-        std::shared_ptr<Tensor> wkv;                    // [kv_lora_rank, hidden_dim]
-        std::shared_ptr<Tensor> wo_a;                   // [o_group_dim, o_lora_rank] or similar
-        std::shared_ptr<Tensor> wo_b;                   // [hidden_dim, o_group_dim]
-        
-        // Shared Expert weights
-        std::shared_ptr<Tensor> shared_gate;            // [ffn_hidden_dim, hidden_dim]
-        std::shared_ptr<Tensor> shared_up;              // [ffn_hidden_dim, hidden_dim]
-        std::shared_ptr<Tensor> shared_down;            // [hidden_dim, ffn_hidden_dim]
-
-        // Expert Router gate weight
-        std::shared_ptr<Tensor> router_gate;            // [num_experts, hidden_dim]
-    };
-    
-    std::vector<LayerBaseWeights> layers;
+    virtual void forward(int token_id, int pos, InferenceContext& ctx) = 0;
 };
 
 #endif // MODEL_H

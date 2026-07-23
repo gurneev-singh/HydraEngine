@@ -18,17 +18,17 @@ $LocalGpp = "$Home\w64devkit\bin\g++.exe"
 if (Test-Path $LocalGpp) {
     $Compiler = "Local g++ (w64devkit)"
     $env:PATH = "$Home\w64devkit\bin;" + $env:PATH
-    $CompileCmd = "& `"$LocalGpp`" -O3 -std=c++17 src/tensor.cpp src/cache.cpp src/ops.cpp src/model.cpp src/tokenizer.cpp src/main.cpp -o bin/moe_cache_test.exe"
+    $CompileCmd = "& `"$LocalGpp`" -O3 -std=c++17 src/tensor.cpp src/cache.cpp src/ops.cpp src/model.cpp src/models/deepseek_v4.cpp src/models/glm_5_2.cpp src/models/kimi_k3.cpp src/tokenizer.cpp src/main.cpp -o bin/moe_cache_test.exe"
 }
 # 2. Check for system g++ (MinGW)
 elseif (Get-Command "g++" -ErrorAction SilentlyContinue) {
     $Compiler = "g++"
-    $CompileCmd = "g++ -O3 -std=c++17 src/tensor.cpp src/cache.cpp src/ops.cpp src/model.cpp src/tokenizer.cpp src/main.cpp -o bin/moe_cache_test.exe"
+    $CompileCmd = "g++ -O3 -std=c++17 src/tensor.cpp src/cache.cpp src/ops.cpp src/model.cpp src/models/deepseek_v4.cpp src/models/glm_5_2.cpp src/models/kimi_k3.cpp src/tokenizer.cpp src/main.cpp -o bin/moe_cache_test.exe"
 }
 # 3. Check for MSVC cl
 elseif (Get-Command "cl" -ErrorAction SilentlyContinue) {
     $Compiler = "cl"
-    $CompileCmd = "cl /EHsc /O2 /std:c++17 src/tensor.cpp src/cache.cpp src/ops.cpp src/model.cpp src/tokenizer.cpp src/main.cpp /Febin/moe_cache_test.exe"
+    $CompileCmd = "cl /EHsc /O2 /std:c++17 src/tensor.cpp src/cache.cpp src/ops.cpp src/model.cpp src/models/deepseek_v4.cpp src/models/glm_5_2.cpp src/models/kimi_k3.cpp src/tokenizer.cpp src/main.cpp /Febin/moe_cache_test.exe"
 }
 
 if ($Compiler -eq "") {
