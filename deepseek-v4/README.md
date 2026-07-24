@@ -93,3 +93,25 @@ Since only 6 out of 256 experts are activated per token, MoE routing follows a Z
 * **On-Demand Page-in:** When a token requests an expert not in cache (Cache Miss), the virtual pager evicts the least recently used expert from RAM, and memory-maps (`mmap` / `MapViewOfFile`) the new expert file directly from the NVMe SSD.
 * **Active RAM Footprint:**
   $$\text{Total RAM} = 4.22\text{ GB (Embeddings + Head)} + 0.1\text{ GB (Active Layer Base)} + 0.9\text{ GB (LRU Cache)} + 0.1\text{ GB (Buffers)} \approx \mathbf{5.32\text{ GB}}$$
+
+---
+
+## 💾 OS-Level Memory-Mapping & Zero-Copy Architecture
+
+To eliminate the latency spikes and double-buffering copying overhead typical in standard file I/O, HydraEngine operates via a custom zero-copy memory-mapped structure:
+
+### 1. Zero-Copy Pointer Mapping
+Instead of reading expert weights into intermediate process buffers via standard file systems (`fread` / `ifstream`), HydraEngine memory-maps each expert using OS-level kernels:
+* **Windows:** `CreateFileA` + `CreateFileMapping` + `MapViewOfFile`
+* **Linux:** `open` + `mmap`
+
+This maps the expert files directly into the virtual address space of the process. When the router requests an expert's weights, the CPU accesses the mapped memory addresses directly, triggering a hardware-level page fault that streams the data directly from the disk controller (DMA) into physical memory pages mapped to our process. This **bypasses double-buffering completely**, eliminating intermediate memory copies.
+
+### 2. Explicit OS Page Cache Eviction
+If the OS attempts to cache all expert weights in its page cache indefinitely, it will lead to memory bloat and trigger kernel swapping. 
+
+HydraEngine avoids this by pairing memory-mapping with active memory management:
+* The application maintains a custom LRU (Least Recently Used) cache tracking active expert pointers.
+* The moment an expert is evicted from the cache, HydraEngine explicitly calls `UnmapViewOfFile` (Windows) or `munmap` (Linux).
+* This releases the virtual memory mapping and signals the OS kernel's memory manager to immediately reclaim the physical pages, preventing page cache pollution and ensuring the RAM footprint remains strictly bounded at **~5.33 GB** even after millions of tokens.
+
