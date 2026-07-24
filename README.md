@@ -122,6 +122,11 @@ DeepSeek-V4 natively trains with a **Multi-Token Prediction (MTP)** block (locat
 * Concurrently, the MTP layer projects this representation to speculatively output the *subsequent* token in the same forward pass.
 * This speculative candidate is validated against the base model's logits, allowing HydraEngine to generate up to **2 tokens per forward pass** (boosting local token throughput by up to **1.8x** on standard laptops).
 
+### 4. OS-Level Memory-Mapping & Zero-Copy Architecture
+To eliminate the latency spikes and double-buffering copying overhead typical in standard file I/O, HydraEngine operates via a custom zero-copy memory-mapped structure:
+* **Zero-Copy Pointer Mapping:** Instead of reading expert weights into intermediate process buffers via standard file systems (`fread`), HydraEngine memory-maps each expert directly into the virtual address space of the process (`mmap` on Linux / `MapViewOfFile` on Windows). When the CPU accesses these addresses, a hardware-level page fault streams the data directly from the disk controller (DMA) into physical memory, bypassing double-buffering copy overhead.
+* **Explicit OS Page Cache Eviction:** To prevent OS page cache bloat from triggering kernel swapping, HydraEngine pairs memory-mapping with active cache management. The moment an expert is evicted from the custom LRU cache, the engine explicitly unmaps the file view (`munmap` / `UnmapViewOfFile`). This signals the OS kernel to immediately reclaim the physical pages, keeping the RAM footprint strictly bounded at **~5.33 GB** even after millions of tokens.
+
 ---
 
 ## 🎓 Developer's Note & Hardware Limitations
