@@ -61,7 +61,7 @@ bool MoEModel::load_base_model() {
     // Map permanent vocabulary embeddings and output weights
     token_embeddings = meta_file->map_tensor("embed.weight");
     output_norm = meta_file->map_tensor("norm.weight");
-    lm_head = meta_file->map_tensor("lm_head.weight");
+    lm_head = meta_file->map_tensor("head.weight");
     
     // Pre-allocate and map per-layer base weights
     layers.resize(config.num_layers);
@@ -75,10 +75,10 @@ bool MoEModel::load_base_model() {
             return false;
         }
         
-        layers[l].input_norm = layers[l].layer_file->map_tensor("input_layernorm.weight");
-        layers[l].post_attention_norm = layers[l].layer_file->map_tensor("post_attention_layernorm.weight");
-        layers[l].q_norm = layers[l].layer_file->map_tensor("self_attn.q_norm.weight");
-        layers[l].kv_norm = layers[l].layer_file->map_tensor("self_attn.kv_norm.weight");
+        layers[l].input_norm = layers[l].layer_file->map_tensor("attn_norm.weight");
+        layers[l].post_attention_norm = layers[l].layer_file->map_tensor("ffn_norm.weight");
+        layers[l].q_norm = layers[l].layer_file->map_tensor("attn.q_norm.weight");
+        layers[l].kv_norm = layers[l].layer_file->map_tensor("attn.kv_norm.weight");
         
         layers[l].wq_a = layers[l].layer_file->map_tensor("self_attn.wq_a.weight");
         layers[l].wq_b = layers[l].layer_file->map_tensor("self_attn.wq_b.weight");

@@ -226,6 +226,7 @@ for idx, filename in enumerate(raw_files):
                 
             # A. Process routed experts: layers.{L}.ffn.experts.{E}.{w_id}.weight
             if "ffn.experts" in name and name.endswith(".weight"):
+                continue
                 # Parse layer and expert IDs
                 parts = name.split(".")
                 layer_id = int(parts[1])
