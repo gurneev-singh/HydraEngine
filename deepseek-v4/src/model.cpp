@@ -355,14 +355,22 @@ void MoEModel::forward(int token_id, int pos, InferenceContext& ctx) {
             }
         }
         
-        // Convert router logits to probabilities
-        ops::softmax(ctx.router_logits.data(), config.num_experts);
-        
-        // Select Top-K (config.num_active_experts) experts
+        // Compute affinity scores using stable SqrtSoftplus gating for DeepSeek-V4
         std::vector<std::pair<float, int>> expert_scores;
         for (int e = 0; e < config.num_experts; ++e) {
-            expert_scores.push_back({ctx.router_logits[e], e});
+            float z = ctx.router_logits[e];
+            float s = 0.0f;
+            if (z > 20.0f) {
+                s = std::sqrt(z);
+            } else if (z < -20.0f) {
+                s = 0.0f;
+            } else {
+                s = std::sqrt(std::log(1.0f + std::exp(z)));
+            }
+            expert_scores.push_back({s, e});
         }
+        
+        // Select Top-K (config.num_active_experts) experts
         std::sort(expert_scores.rbegin(), expert_scores.rend()); // Sort descending
         
         // Re-normalize active expert probabilities to sum to 1.0
@@ -370,13 +378,15 @@ void MoEModel::forward(int token_id, int pos, InferenceContext& ctx) {
         for (int k = 0; k < config.num_active_experts; ++k) {
             sum_probs += expert_scores[k].first;
         }
+        if (sum_probs == 0.0f) sum_probs = 1e-5f;
         
         // Clear layer FFN output accumulator
         std::fill(ctx.layer_mlp_out.begin(), ctx.layer_mlp_out.end(), 0.0f);
         
         // 1. Run 6 active routed experts
         for (int k = 0; k < config.num_active_experts; ++k) {
-            float route_prob = expert_scores[k].first / sum_probs;
+            // Apply normalized gate scaled by routed_scaling_factor (1.5)
+            float route_prob = 1.5f * (expert_scores[k].first / sum_probs);
             int expert_id = expert_scores[k].second;
             
             // Retrieve/page expert via LRU cache
@@ -628,12 +638,22 @@ void MoEModel::forward_batch(const std::vector<int>& token_ids, InferenceContext
                          hidden_dim, config.norm_epsilon);
             
             ops::matmul(ctx.router_logits.data(), batch_norm[t].data(), *layer_w.router_gate);
-            ops::softmax(ctx.router_logits.data(), config.num_experts);
             
+            // Compute affinity scores using stable SqrtSoftplus gating for DeepSeek-V4
             std::vector<std::pair<float, int>> expert_scores;
             for (int e = 0; e < config.num_experts; ++e) {
-                expert_scores.push_back({ctx.router_logits[e], e});
+                float z = ctx.router_logits[e];
+                float s = 0.0f;
+                if (z > 20.0f) {
+                    s = std::sqrt(z);
+                } else if (z < -20.0f) {
+                    s = 0.0f;
+                } else {
+                    s = std::sqrt(std::log(1.0f + std::exp(z)));
+                }
+                expert_scores.push_back({s, e});
             }
+            
             std::sort(expert_scores.rbegin(), expert_scores.rend());
             
             for (int k = 0; k < config.num_active_experts; ++k) {
@@ -652,12 +672,14 @@ void MoEModel::forward_batch(const std::vector<int>& token_ids, InferenceContext
             const auto& expert_scores = all_expert_selections[t];
             float sum_probs = 0.0f;
             for (int k = 0; k < config.num_active_experts; ++k) sum_probs += expert_scores[k].first;
+            if (sum_probs == 0.0f) sum_probs = 1e-5f;
             
             std::fill(ctx.layer_mlp_out.begin(), ctx.layer_mlp_out.end(), 0.0f);
             
             // Routed experts
             for (int k = 0; k < config.num_active_experts; ++k) {
-                float route_prob = expert_scores[k].first / sum_probs;
+                // Apply normalized gate scaled by routed_scaling_factor (1.5)
+                float route_prob = 1.5f * (expert_scores[k].first / sum_probs);
                 int expert_id = expert_scores[k].second;
                 auto expert = expert_cache->get_expert(l, expert_id);
                 if (!expert) continue;

@@ -29,51 +29,55 @@ def convert_bf16_to_f32(data_bytes):
     f32_view[:] = bf16_arr.astype(np.uint32) << 16
     return f32_arr
 
-# Helper to quantize Float32 to Q8_0 block format
+# Helper to quantize Float32 to Q8_0 block format using PyTorch
 def quantize_q8_0(f32_arr):
-    size = f32_arr.size
-    remainder = size % 32
+    t = torch.from_numpy(f32_arr) if isinstance(f32_arr, np.ndarray) else f32_arr
+    remainder = t.numel() % 32
     if remainder != 0:
         padding = 32 - remainder
-        f32_arr = np.concatenate([f32_arr, np.zeros(padding, dtype=np.float32)])
+        t = torch.cat([t, torch.zeros(padding, dtype=torch.float32)])
         
-    blocks = f32_arr.reshape(-1, 32)
-    max_vals = np.max(np.abs(blocks), axis=1)
+    blocks = t.view(-1, 32)
+    max_vals, _ = torch.max(torch.abs(blocks), dim=1, keepdim=True)
     scales = max_vals / 127.0
-    scales = np.where(scales == 0.0, 1e-5, scales)
+    scales = torch.where(scales == 0.0, torch.tensor(1e-5), scales)
     
-    q_vals = np.round(blocks / scales[:, np.newaxis])
-    q_vals = np.clip(q_vals, -128, 127).astype(np.int8)
+    q_vals = torch.round(blocks / scales)
+    q_vals = torch.clamp(q_vals, -128, 127).to(torch.int8)
     
-    block_type = np.dtype([('d', '<f4'), ('qs', 'i1', (32,))])
-    packed = np.zeros(blocks.shape[0], dtype=block_type)
-    packed['d'] = scales
-    packed['qs'] = q_vals
+    scales_np = scales.squeeze(1).numpy().astype('<f4')
+    q_vals_np = q_vals.numpy()
+    
+    packed = np.empty((blocks.shape[0], 36), dtype=np.uint8)
+    packed[:, :4] = scales_np.view(np.uint8).reshape(-1, 4)
+    packed[:, 4:] = q_vals_np.view(np.uint8)
     return packed.tobytes()
 
-# Helper to quantize Float32 to Q4_0 block format
+# Helper to quantize Float32 to Q4_0 block format using PyTorch
 def quantize_q4_0(f32_arr):
-    size = f32_arr.size
-    remainder = size % 32
+    t = torch.from_numpy(f32_arr) if isinstance(f32_arr, np.ndarray) else f32_arr
+    remainder = t.numel() % 32
     if remainder != 0:
         padding = 32 - remainder
-        f32_arr = np.concatenate([f32_arr, np.zeros(padding, dtype=np.float32)])
+        t = torch.cat([t, torch.zeros(padding, dtype=torch.float32)])
         
-    blocks = f32_arr.reshape(-1, 32)
-    max_vals = np.max(np.abs(blocks), axis=1)
+    blocks = t.view(-1, 32)
+    max_vals, _ = torch.max(torch.abs(blocks), dim=1, keepdim=True)
     scales = max_vals / 8.0
-    scales = np.where(scales == 0.0, 1e-5, scales)
+    scales = torch.where(scales == 0.0, torch.tensor(1e-5), scales)
     
-    q_vals = np.round(blocks / scales[:, np.newaxis]) + 8
-    q_vals = np.clip(q_vals, 0, 15).astype(np.uint8)
+    q_vals = torch.round(blocks / scales) + 8
+    q_vals = torch.clamp(q_vals, 0, 15).to(torch.uint8)
     
-    q_pairs = q_vals.reshape(-1, 16, 2)
+    q_pairs = q_vals.view(-1, 16, 2)
     packed_qs = q_pairs[:, :, 0] | (q_pairs[:, :, 1] << 4)
     
-    block_type = np.dtype([('d', '<f4'), ('qs', 'u1', (16,))])
-    packed = np.zeros(blocks.shape[0], dtype=block_type)
-    packed['d'] = scales
-    packed['qs'] = packed_qs
+    scales_np = scales.squeeze(1).numpy().astype('<f4')
+    packed_qs_np = packed_qs.numpy()
+    
+    packed = np.empty((blocks.shape[0], 20), dtype=np.uint8)
+    packed[:, :4] = scales_np.view(np.uint8).reshape(-1, 4)
+    packed[:, 4:] = packed_qs_np
     return packed.tobytes()
 
 # Helper to quantize Float32 to Q2_K block format (2-bit weights, block size 32)
@@ -203,6 +207,10 @@ for idx, filename in enumerate(raw_files):
     file_path = os.path.join(D_DIR, filename)
     print(f"\nProcessing partition [{idx+1}/{len(raw_files)}]: {filename}...")
     
+    # Dictionary to buffer routed experts of the current layer in RAM
+    expert_buffer = {} # expert_id -> {proj_name: data_bytes}
+    current_layer_id = None
+    
     with open(file_path, "rb") as f:
         header_size = struct.unpack("<Q", f.read(8))[0]
         header_json = f.read(header_size).decode('utf-8')
@@ -221,17 +229,17 @@ for idx, filename in enumerate(raw_files):
         processed_keys = set()
         
         for name in keys:
-            if name == "__metadata__" or name in processed_keys:
+            if name == "__metadata__" or name in processed_keys or name.endswith(".scale"):
                 continue
                 
             # A. Process routed experts: layers.{L}.ffn.experts.{E}.{w_id}.weight
             if "ffn.experts" in name and name.endswith(".weight"):
-                continue
                 # Parse layer and expert IDs
                 parts = name.split(".")
                 layer_id = int(parts[1])
                 expert_id = int(parts[4])
                 w_id = parts[5] # "w1", "w2", or "w3"
+                current_layer_id = layer_id
                 
                 scale_name = name.replace(".weight", ".scale")
                 if scale_name in header:
@@ -251,31 +259,14 @@ for idx, filename in enumerate(raw_files):
                     # Dequantize
                     f32_weight = dequantize_weight_and_scale(w_bytes, s_bytes, meta_w["shape"], meta_s["shape"])
                     
-                    # Quantize to Q2_K
-                    q2_bytes = quantize_q2_k(f32_weight)
+                    # Quantize to Q4_0
+                    q4_bytes = quantize_q4_0(f32_weight)
                     
-                    # Write to expert file
-                    exp_file_name = f"expert_{layer_id}_{expert_id}.safetensors"
-                    exp_file_path = os.path.join(OUT_DIR, "experts", exp_file_name)
+                    if expert_id not in expert_buffer:
+                        expert_buffer[expert_id] = {}
                     
-                    # Load existing keys if file exists to merge w1, w2, w3
-                    existing = {}
-                    if os.path.exists(exp_file_path):
-                        with open(exp_file_path, "rb") as exp_f:
-                            e_h_size = struct.unpack("<Q", exp_f.read(8))[0]
-                            e_h_json = exp_f.read(e_h_size).decode('utf-8')
-                            e_h = json.loads(e_h_json)
-                            e_offset = 8 + e_h_size
-                            for e_name, e_meta in e_h.items():
-                                if e_name == "__metadata__": continue
-                                exp_f.seek(e_offset + e_meta["data_offsets"][0])
-                                existing[e_name] = (e_meta["shape"], e_meta["dtype"], exp_f.read(e_meta["data_offsets"][1] - e_meta["data_offsets"][0]))
-                    
-                    # Map to standard projection names
                     proj_map = {"w1": "gate_proj.weight", "w2": "down_proj.weight", "w3": "up_proj.weight"}
-                    existing[proj_map[w_id]] = (meta_w["shape"], "Q2_K", q2_bytes)
-                    
-                    write_safetensors(exp_file_path, existing)
+                    expert_buffer[expert_id][proj_map[w_id]] = q4_bytes
                     
                     processed_keys.add(name)
                     processed_keys.add(scale_name)
@@ -305,7 +296,7 @@ for idx, filename in enumerate(raw_files):
                     
                     processed_keys.add(name)
                     processed_keys.add(scale_name)
-
+ 
             # C. Process FP8 attention projection weights: layers.{L}.attn.{proj}.weight
             elif "attn" in name and name.endswith(".weight") and header[name]["dtype"] == "F8_E4M3":
                 parts = name.split(".")
@@ -363,13 +354,23 @@ for idx, filename in enumerate(raw_files):
                 
                 processed_keys.add(name)
         
-        # Flush completed layer base buffers to individual files to free RAM
-        # If we have completed layers in layer_buffers, we check if they are done.
-        # Since files are sequential, if a layer index is fully parsed (or we can just write them layer by layer at the very end),
-        # let's save completed layers.
-        # To be safe, we can write out the layer files at the end of the script, but if we want to save RAM,
-        # we can check if the current file does not contain a layer, we write it out.
-        # Let's just write them out at the end, as 43 layers of 200MB each is only 8.6 GB, which fits easily in 32GB RAM.
+        # Flush buffered experts of the current layer partition to disk (written exactly once)
+        if expert_buffer and current_layer_id is not None:
+            print(f"  Flushing {len(expert_buffer)} expert files for layer {current_layer_id}...")
+            for expert_id, weights in expert_buffer.items():
+                exp_file_name = f"expert_{current_layer_id}_{expert_id}.safetensors"
+                exp_file_path = os.path.join(OUT_DIR, "experts", exp_file_name)
+                
+                tensors = {}
+                for proj_name, q_bytes in weights.items():
+                    if proj_name == "down_proj.weight":
+                        shape = [4096, 1024]
+                    else:
+                        shape = [2048, 2048]
+                    tensors[proj_name] = (shape, "Q4_0", q_bytes)
+                
+                write_safetensors(exp_file_path, tensors)
+        
         mmapped_file.close()
 
 # Write out the base meta file
