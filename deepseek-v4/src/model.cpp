@@ -106,6 +106,21 @@ void MoEModel::forward(int token_id, int pos, InferenceContext& ctx) {
     const float* token_vector = embed_data + (token_id * hidden_dim);
     std::memcpy(ctx.hidden_state.data(), token_vector, hidden_dim * sizeof(float));
     
+    // Print first 5 floats of hidden state for embedding verification
+    std::cout << "[Debug Embed] Token " << token_id << " first 5 floats: ";
+    for (int i = 0; i < 5; ++i) {
+        std::cout << ctx.hidden_state[i] << " ";
+    }
+    std::cout << std::endl;
+    
+    // Debug embedding NaN
+    for (int i = 0; i < hidden_dim; ++i) {
+        if (std::isnan(ctx.hidden_state[i])) {
+            std::cout << "[Debug NaN] hidden_state is NaN right after embedding! token_id: " << token_id << std::endl;
+            return;
+        }
+    }
+    
     // 2. Loop over layers
     for (int l = 0; l < config.num_layers; ++l) {
         const auto& layer_w = layers[l];
@@ -118,23 +133,74 @@ void MoEModel::forward(int token_id, int pos, InferenceContext& ctx) {
                       static_cast<const float*>(layer_w.input_norm->data), 
                       config.hidden_dim, config.norm_epsilon);
                       
+        // Debug NaN after input norm
+        for (int i = 0; i < hidden_dim; ++i) {
+            if (std::isnan(ctx.norm_buffer[i])) {
+                std::cout << "[Debug NaN] Layer " << l << " norm_buffer is NaN after input_norm!" << std::endl;
+                return;
+            }
+        }
+                      
         // 1. Query projection
         // q_latent = norm_buffer * wq_a [q_lora_rank]
         ops::matmul(ctx.q_latent.data(), ctx.norm_buffer.data(), *layer_w.wq_a);
+        
+        // Debug NaN after wq_a matmul
+        for (int i = 0; i < config.q_lora_rank; ++i) {
+            if (std::isnan(ctx.q_latent[i])) {
+                std::cout << "[Debug NaN] Layer " << l << " q_latent is NaN after wq_a matmul!" << std::endl;
+                return;
+            }
+        }
+        
         // Normalize q_latent
         ops::rms_norm(ctx.q_latent.data(), ctx.q_latent.data(), 
                       static_cast<const float*>(layer_w.q_norm->data), 
                       config.q_lora_rank, config.norm_epsilon);
+        
+        // Debug NaN after q_norm
+        for (int i = 0; i < config.q_lora_rank; ++i) {
+            if (std::isnan(ctx.q_latent[i])) {
+                std::cout << "[Debug NaN] Layer " << l << " q_latent is NaN after q_norm!" << std::endl;
+                return;
+            }
+        }
+        
         // q = q_latent * wq_b [num_heads * head_dim]
         ops::matmul(ctx.q.data(), ctx.q_latent.data(), *layer_w.wq_b);
+        
+        // Debug NaN after wq_b matmul
+        for (int i = 0; i < config.num_heads * config.head_dim; ++i) {
+            if (std::isnan(ctx.q[i])) {
+                std::cout << "[Debug NaN] Layer " << l << " q is NaN after wq_b matmul!" << std::endl;
+                return;
+            }
+        }
         
         // 2. Key-Value projection
         // kv_latent = norm_buffer * wkv [kv_lora_rank]
         ops::matmul(ctx.kv_latent.data(), ctx.norm_buffer.data(), *layer_w.wkv);
+        
+        // Debug NaN after wkv matmul
+        for (int i = 0; i < config.kv_lora_rank; ++i) {
+            if (std::isnan(ctx.kv_latent[i])) {
+                std::cout << "[Debug NaN] Layer " << l << " kv_latent is NaN after wkv matmul!" << std::endl;
+                return;
+            }
+        }
+        
         // Normalize kv_latent
         ops::rms_norm(ctx.kv_latent.data(), ctx.kv_latent.data(), 
                       static_cast<const float*>(layer_w.kv_norm->data), 
                       config.kv_lora_rank, config.norm_epsilon);
+                      
+        // Debug NaN after kv_norm
+        for (int i = 0; i < config.kv_lora_rank; ++i) {
+            if (std::isnan(ctx.kv_latent[i])) {
+                std::cout << "[Debug NaN] Layer " << l << " kv_latent is NaN after kv_norm!" << std::endl;
+                return;
+            }
+        }
         
         // 3. Apply Decoupled RoPE
         // RoPE is applied to the last 64 elements of each head's query, and the last 64 of kv_latent
@@ -145,6 +211,20 @@ void MoEModel::forward(int token_id, int pos, InferenceContext& ctx) {
         
         float* kv_rope_ptr = ctx.kv_latent.data() + (config.head_dim - config.rope_head_dim);
         ops::rope(kv_rope_ptr, 1, config.rope_head_dim, pos, config.rope_theta);
+        
+        // Debug NaN after RoPE
+        for (int i = 0; i < config.num_heads * config.head_dim; ++i) {
+            if (std::isnan(ctx.q[i])) {
+                std::cout << "[Debug NaN] Layer " << l << " q is NaN after RoPE!" << std::endl;
+                return;
+            }
+        }
+        for (int i = 0; i < config.kv_lora_rank; ++i) {
+            if (std::isnan(ctx.kv_latent[i])) {
+                std::cout << "[Debug NaN] Layer " << l << " kv_latent is NaN after RoPE!" << std::endl;
+                return;
+            }
+        }
         
         // 4. Store KV latent state in Cache
         float* layer_cache_ptr = ctx.kv_cache[l].data() + (pos * config.head_dim);
@@ -183,6 +263,14 @@ void MoEModel::forward(int token_id, int pos, InferenceContext& ctx) {
             }
         }
         
+        // Debug NaN after attention aggregation
+        for (int i = 0; i < config.num_heads * config.head_dim; ++i) {
+            if (std::isnan(ctx.attn_out[i])) {
+                std::cout << "[Debug NaN] Layer " << l << " attn_out is NaN after attention scores!" << std::endl;
+                return;
+            }
+        }
+        
         // 6. Output Projection via Grouped Low-Rank
         // We have 8 groups. Each group projects 8 heads (8 * 512 = 4096 dims) to 1024 latent dims.
         std::vector<float> o_latent(8 * 1024, 0.0f);
@@ -193,15 +281,51 @@ void MoEModel::forward(int token_id, int pos, InferenceContext& ctx) {
             // Slice wo_a: shape [8192, 4096]. Group g slice is [1024, 4096] at row offset g * 1024
             Tensor wo_a_slice = *layer_w.wo_a;
             wo_a_slice.shape = {1024, 8 * config.head_dim};
-            wo_a_slice.data = static_cast<char*>(layer_w.wo_a->data) + (g * 1024 * (8 * config.head_dim) * sizeof(float)); // Adjust offsets if quantized
+            
+            size_t row_size_bytes = 0;
+            if (layer_w.wo_a->type == DataType::F32) {
+                row_size_bytes = layer_w.wo_a->shape[1] * sizeof(float);
+            } else if (layer_w.wo_a->type == DataType::Q8_0) {
+                row_size_bytes = (layer_w.wo_a->shape[1] / 32) * 36;
+            } else {
+                std::cerr << "[Error] Unsupported type for wo_a projection!" << std::endl;
+                return;
+            }
+            
+            wo_a_slice.data = static_cast<char*>(layer_w.wo_a->data) + (g * 1024 * row_size_bytes);
             
             // If quantized, C++ GEMM handles it automatically because type is passed in the slice Tensor
             ops::matmul(group_out, group_in, wo_a_slice);
         }
         
+        // Debug NaN after wo_a matmuls
+        for (int i = 0; i < 8 * 1024; ++i) {
+            if (std::isnan(o_latent[i])) {
+                std::cout << "[Debug NaN] Layer " << l << " o_latent is NaN after wo_a projections!" << std::endl;
+                return;
+            }
+        }
+        
         // Project back to hidden_dim (4096) via wo_b
         ops::matmul(ctx.norm_buffer.data(), o_latent.data(), *layer_w.wo_b);
+        
+        // Debug NaN after wo_b matmul
+        for (int i = 0; i < config.hidden_dim; ++i) {
+            if (std::isnan(ctx.norm_buffer[i])) {
+                std::cout << "[Debug NaN] Layer " << l << " norm_buffer is NaN after wo_b matmul!" << std::endl;
+                return;
+            }
+        }
+        
         ops::vec_add(ctx.hidden_state.data(), ctx.norm_buffer.data(), config.hidden_dim);
+        
+        // Debug NaN after attention residual addition
+        for (int i = 0; i < config.hidden_dim; ++i) {
+            if (std::isnan(ctx.hidden_state[i])) {
+                std::cout << "[Debug NaN] Layer " << l << " hidden_state is NaN after attention residual addition!" << std::endl;
+                return;
+            }
+        }
         
         // ----------------------------------------------------
         // B. MoE MLP Block (Residual Connection)
@@ -211,8 +335,24 @@ void MoEModel::forward(int token_id, int pos, InferenceContext& ctx) {
                       static_cast<const float*>(layer_w.post_attention_norm->data), 
                       config.hidden_dim, config.norm_epsilon);
                       
+        // Debug NaN after post-attention norm
+        for (int i = 0; i < config.hidden_dim; ++i) {
+            if (std::isnan(ctx.norm_buffer[i])) {
+                std::cout << "[Debug NaN] Layer " << l << " norm_buffer is NaN after post_attention_norm!" << std::endl;
+                return;
+            }
+        }
+                      
         // Get logits from Router Gate: router_logits = norm_buffer * router_gate
         ops::matmul(ctx.router_logits.data(), ctx.norm_buffer.data(), *layer_w.router_gate);
+        
+        // Debug NaN after router gate matmul
+        for (int i = 0; i < config.num_experts; ++i) {
+            if (std::isnan(ctx.router_logits[i])) {
+                std::cout << "[Debug NaN] Layer " << l << " router_logits is NaN after router_gate matmul!" << std::endl;
+                return;
+            }
+        }
         
         // Convert router logits to probabilities
         ops::softmax(ctx.router_logits.data(), config.num_experts);
@@ -244,10 +384,27 @@ void MoEModel::forward(int token_id, int pos, InferenceContext& ctx) {
             
             // Gate projection: gate_out = norm_buffer * gate_proj
             ops::matmul(ctx.expert_gate_out.data(), ctx.norm_buffer.data(), *expert->gate_proj);
+            
+            // Debug NaN after expert gate matmul
+            for (int i = 0; i < config.ffn_hidden_dim; ++i) {
+                if (std::isnan(ctx.expert_gate_out[i])) {
+                    std::cout << "[Debug NaN] Layer " << l << " Expert " << expert_id << " gate_out is NaN after gate matmul!" << std::endl;
+                    return;
+                }
+            }
+            
             ops::silu(ctx.expert_gate_out.data(), ctx.expert_gate_out.data(), config.ffn_hidden_dim);
             
             // Up projection: up_out = norm_buffer * up_proj
             ops::matmul(ctx.expert_up_out.data(), ctx.norm_buffer.data(), *expert->up_proj);
+            
+            // Debug NaN after expert up matmul
+            for (int i = 0; i < config.ffn_hidden_dim; ++i) {
+                if (std::isnan(ctx.expert_up_out[i])) {
+                    std::cout << "[Debug NaN] Layer " << l << " Expert " << expert_id << " up_out is NaN after up matmul!" << std::endl;
+                    return;
+                }
+            }
             
             // Activation gating: gate_out = gate_out * up_out
             ops::vec_mul(ctx.expert_gate_out.data(), ctx.expert_up_out.data(), config.ffn_hidden_dim);
@@ -255,19 +412,52 @@ void MoEModel::forward(int token_id, int pos, InferenceContext& ctx) {
             // Down projection: down_out = gate_out * down_proj
             ops::matmul(ctx.expert_down_out.data(), ctx.expert_gate_out.data(), *expert->down_proj);
             
+            // Debug NaN after expert down matmul
+            for (int i = 0; i < config.hidden_dim; ++i) {
+                if (std::isnan(ctx.expert_down_out[i])) {
+                    std::cout << "[Debug NaN] Layer " << l << " Expert " << expert_id << " down_out is NaN after down matmul!" << std::endl;
+                    return;
+                }
+            }
+            
             // Accumulate scaled expert output: layer_mlp_out += down_out * route_prob
             for (int d = 0; d < config.hidden_dim; ++d) {
                 ctx.layer_mlp_out[d] += ctx.expert_down_out[d] * route_prob;
             }
         }
         
+        // Debug NaN after routed experts accumulation
+        for (int i = 0; i < config.hidden_dim; ++i) {
+            if (std::isnan(ctx.layer_mlp_out[i])) {
+                std::cout << "[Debug NaN] Layer " << l << " layer_mlp_out is NaN after routed experts!" << std::endl;
+                return;
+            }
+        }
+        
         // 2. Run 1 always-active shared expert
         // Gate projection: shared_gate_out = norm_buffer * shared_gate
         ops::matmul(ctx.expert_gate_out.data(), ctx.norm_buffer.data(), *layer_w.shared_gate);
+        
+        // Debug NaN after shared gate matmul
+        for (int i = 0; i < config.ffn_hidden_dim; ++i) {
+            if (std::isnan(ctx.expert_gate_out[i])) {
+                std::cout << "[Debug NaN] Layer " << l << " shared_gate_out is NaN after gate matmul!" << std::endl;
+                return;
+            }
+        }
+        
         ops::silu(ctx.expert_gate_out.data(), ctx.expert_gate_out.data(), config.ffn_hidden_dim);
         
         // Up projection: shared_up_out = norm_buffer * shared_up
         ops::matmul(ctx.expert_up_out.data(), ctx.norm_buffer.data(), *layer_w.shared_up);
+        
+        // Debug NaN after shared up matmul
+        for (int i = 0; i < config.ffn_hidden_dim; ++i) {
+            if (std::isnan(ctx.expert_up_out[i])) {
+                std::cout << "[Debug NaN] Layer " << l << " shared_up_out is NaN after up matmul!" << std::endl;
+                return;
+            }
+        }
         
         // Activation gating: shared_gate_out = shared_gate_out * shared_up_out
         ops::vec_mul(ctx.expert_gate_out.data(), ctx.expert_up_out.data(), config.ffn_hidden_dim);
@@ -275,13 +465,37 @@ void MoEModel::forward(int token_id, int pos, InferenceContext& ctx) {
         // Down projection: shared_down_out = shared_gate_out * shared_down
         ops::matmul(ctx.expert_down_out.data(), ctx.expert_gate_out.data(), *layer_w.shared_down);
         
+        // Debug NaN after shared down matmul
+        for (int i = 0; i < config.hidden_dim; ++i) {
+            if (std::isnan(ctx.expert_down_out[i])) {
+                std::cout << "[Debug NaN] Layer " << l << " shared_down_out is NaN after down matmul!" << std::endl;
+                return;
+            }
+        }
+        
         // Accumulate shared expert output: layer_mlp_out += shared_down_out
         for (int d = 0; d < config.hidden_dim; ++d) {
             ctx.layer_mlp_out[d] += ctx.expert_down_out[d];
         }
         
+        // Debug NaN after total FFN accumulation
+        for (int i = 0; i < config.hidden_dim; ++i) {
+            if (std::isnan(ctx.layer_mlp_out[i])) {
+                std::cout << "[Debug NaN] Layer " << l << " layer_mlp_out is NaN after total FFN accumulation!" << std::endl;
+                return;
+            }
+        }
+        
         // Add FFN output back to hidden state (residual connection)
         ops::vec_add(ctx.hidden_state.data(), ctx.layer_mlp_out.data(), config.hidden_dim);
+        
+        // Debug NaN at end of layer
+        for (int i = 0; i < config.hidden_dim; ++i) {
+            if (std::isnan(ctx.hidden_state[i])) {
+                std::cout << "[Debug NaN] Layer " << l << " hidden_state is NaN at end of layer!" << std::endl;
+                return;
+            }
+        }
     }
     
     // 3. Final Output Projections

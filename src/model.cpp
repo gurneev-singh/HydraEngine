@@ -193,7 +193,18 @@ void MoEModel::forward(int token_id, int pos, InferenceContext& ctx) {
             // Slice wo_a: shape [8192, 4096]. Group g slice is [1024, 4096] at row offset g * 1024
             Tensor wo_a_slice = *layer_w.wo_a;
             wo_a_slice.shape = {1024, 8 * config.head_dim};
-            wo_a_slice.data = static_cast<char*>(layer_w.wo_a->data) + (g * 1024 * (8 * config.head_dim) * sizeof(float)); // Adjust offsets if quantized
+            
+            size_t row_size_bytes = 0;
+            if (layer_w.wo_a->type == DataType::F32) {
+                row_size_bytes = layer_w.wo_a->shape[1] * sizeof(float);
+            } else if (layer_w.wo_a->type == DataType::Q8_0) {
+                row_size_bytes = (layer_w.wo_a->shape[1] / 32) * 36;
+            } else {
+                std::cerr << "[Error] Unsupported type for wo_a projection!" << std::endl;
+                return;
+            }
+            
+            wo_a_slice.data = static_cast<char*>(layer_w.wo_a->data) + (g * 1024 * row_size_bytes);
             
             // If quantized, C++ GEMM handles it automatically because type is passed in the slice Tensor
             ops::matmul(group_out, group_in, wo_a_slice);

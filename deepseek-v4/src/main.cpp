@@ -4,6 +4,20 @@
 #include <vector>
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+
+void apply_chat_template_fixes(std::string& prompt) {
+    // Replace "<|User|>" with "<｜User｜>"
+    size_t pos = 0;
+    while ((pos = prompt.find("<|User|>")) != std::string::npos) {
+        prompt.replace(pos, 8, "<｜User｜>");
+    }
+    // Replace "<|Assistant|>" with "<｜Assistant｜>"
+    pos = 0;
+    while ((pos = prompt.find("<|Assistant|>")) != std::string::npos) {
+        prompt.replace(pos, 13, "<｜Assistant｜>");
+    }
+}
 
 int main(int argc, char* argv[]) {
     std::cout << "==================================================" << std::endl;
@@ -62,7 +76,13 @@ int main(int argc, char* argv[]) {
         max_tokens = std::stoi(argv[3]);
     }
     
+    apply_chat_template_fixes(prompt);
     std::vector<int> tokens = tokenizer.encode(prompt);
+    std::cout << "Encoded prompt tokens: ";
+    for (int t : tokens) {
+        std::cout << t << " (" << tokenizer.decode(t) << ") ";
+    }
+    std::cout << std::endl;
 
     // 6. Run generation loop
     std::cout << "\nProcessing Prompt & Generating Output..." << std::endl;
@@ -79,6 +99,25 @@ int main(int argc, char* argv[]) {
         model.forward(token_id, pos, ctx);
         generated_tokens.push_back(token_id);
     }
+
+    // Print debug logits to check for NaN or uninitialized values
+    std::cout << "\n--- Logit Debug ---" << std::endl;
+    int nan_count = 0;
+    float min_l = ctx.logits[0];
+    float max_l = ctx.logits[0];
+    for (int i = 0; i < cfg.vocab_size; ++i) {
+        if (std::isnan(ctx.logits[i])) {
+            nan_count++;
+        }
+        if (ctx.logits[i] < min_l) min_l = ctx.logits[i];
+        if (ctx.logits[i] > max_l) max_l = ctx.logits[i];
+    }
+    std::cout << "- First 5 logits: ";
+    for (int i = 0; i < 5; ++i) {
+        std::cout << ctx.logits[i] << " ";
+    }
+    std::cout << "\n- Min logit: " << min_l << ", Max logit: " << max_l << ", NaN count: " << nan_count << std::endl;
+    std::cout << "-------------------\n" << std::endl;
 
     // Argmax for the very first token (with repetition penalty & BOS suppression)
     int next_token_id = 0;

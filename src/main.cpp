@@ -5,6 +5,19 @@
 #include <algorithm>
 #include <chrono>
 
+void apply_chat_template_fixes(std::string& prompt) {
+    // Replace "<|User|>" with "<｜User｜>"
+    size_t pos = 0;
+    while ((pos = prompt.find("<|User|>")) != std::string::npos) {
+        prompt.replace(pos, 8, "<｜User｜>");
+    }
+    // Replace "<|Assistant|>" with "<｜Assistant｜>"
+    pos = 0;
+    while ((pos = prompt.find("<|Assistant|>")) != std::string::npos) {
+        prompt.replace(pos, 13, "<｜Assistant｜>");
+    }
+}
+
 int main(int argc, char* argv[]) {
     std::cout << "==================================================" << std::endl;
     std::cout << "          HydraEngine C++ Inference Diagnostics" << std::endl;
@@ -62,6 +75,7 @@ int main(int argc, char* argv[]) {
         max_tokens = std::stoi(argv[3]);
     }
     
+    apply_chat_template_fixes(prompt);
     std::vector<int> tokens = tokenizer.encode(prompt);
 
     // 6. Run generation loop
