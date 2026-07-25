@@ -72,6 +72,9 @@ public:
     
     // Runs a single forward pass of the model for a token at a specific position
     void forward(int token_id, int pos, InferenceContext& ctx);
+    
+    // Batched prompt processing: processes all tokens layer-by-layer for massive expert cache efficiency
+    void forward_batch(const std::vector<int>& token_ids, InferenceContext& ctx);
 
 private:
     std::string model_directory;

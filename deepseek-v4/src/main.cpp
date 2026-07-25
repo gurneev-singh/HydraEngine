@@ -90,15 +90,11 @@ int main(int argc, char* argv[]) {
 
     auto t_start = std::chrono::high_resolution_clock::now();
 
-    int pos = 0;
-    std::vector<int> generated_tokens;
-
-    // Process prompt tokens
-    for (; pos < static_cast<int>(tokens.size()); ++pos) {
-        int token_id = tokens[pos];
-        model.forward(token_id, pos, ctx);
-        generated_tokens.push_back(token_id);
-    }
+    // Process prompt tokens using batched layer-by-layer processing
+    // This loads experts ONCE per layer for ALL tokens, instead of once per token
+    model.forward_batch(tokens, ctx);
+    int pos = static_cast<int>(tokens.size());
+    std::vector<int> generated_tokens(tokens.begin(), tokens.end());
 
     // Print debug logits to check for NaN or uninitialized values
     std::cout << "\n--- Logit Debug ---" << std::endl;
