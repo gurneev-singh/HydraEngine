@@ -115,13 +115,12 @@ int main(int argc, char* argv[]) {
     std::cout << "\n- Min logit: " << min_l << ", Max logit: " << max_l << ", NaN count: " << nan_count << std::endl;
     std::cout << "-------------------\n" << std::endl;
 
-    // Argmax for the very first token (with repetition penalty & BOS suppression)
-    int next_token_id = 0;
-    float max_logit = -1e9f;
+    // Sort logits to find and print the top 10 tokens
+    std::vector<std::pair<float, int>> token_logits;
     for (int i = 0; i < cfg.vocab_size; ++i) {
         float logit = ctx.logits[i];
         
-        // Suppress BOS token (0) during generation to avoid loop stutters
+        // Suppress BOS token (0)
         if (i == 0) {
             logit = -1e9f;
         }
@@ -133,11 +132,19 @@ int main(int argc, char* argv[]) {
             }
         }
         
-        if (logit > max_logit) {
-            max_logit = logit;
-            next_token_id = i;
-        }
+        token_logits.push_back({logit, i});
     }
+    
+    std::sort(token_logits.rbegin(), token_logits.rend());
+    
+    std::cout << "Top 10 predicted tokens:" << std::endl;
+    for (int i = 0; i < 10; ++i) {
+        std::cout << "  " << i + 1 << ". Token ID: " << token_logits[i].second 
+                  << " (" << tokenizer.decode(token_logits[i].second) << ") | Logit: " 
+                  << token_logits[i].first << std::endl;
+    }
+    
+    int next_token_id = token_logits[0].second;
 
     auto t_first_token = std::chrono::high_resolution_clock::now();
     double ttft_ms = std::chrono::duration<double, std::milli>(t_first_token - t_start).count();
@@ -159,7 +166,7 @@ int main(int argc, char* argv[]) {
 
         // Argmax with repetition penalty & BOS suppression
         next_token_id = 0;
-        max_logit = -1e9f;
+        float max_logit = -1e9f;
         for (int i = 0; i < cfg.vocab_size; ++i) {
             float logit = ctx.logits[i];
             
