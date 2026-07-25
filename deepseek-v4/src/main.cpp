@@ -86,8 +86,8 @@ int main(int argc, char* argv[]) {
     for (int i = 0; i < cfg.vocab_size; ++i) {
         float logit = ctx.logits[i];
         
-        // Suppress BOS token (3) during generation to avoid loop stutters
-        if (i == 3) {
+        // Suppress BOS token (0) during generation to avoid loop stutters
+        if (i == 0) {
             logit = -1e9f;
         }
         
