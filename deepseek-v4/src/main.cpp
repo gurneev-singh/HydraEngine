@@ -3,6 +3,7 @@
 #include <iostream>
 #include <vector>
 #include <algorithm>
+#include <chrono>
 
 int main(int argc, char* argv[]) {
     std::cout << "==================================================" << std::endl;
@@ -30,31 +31,23 @@ int main(int argc, char* argv[]) {
 
     std::cout << "Initializing HydraEngine MoE Model..." << std::endl;
     std::cout << "- Model Directory: " << model_dir << std::endl;
-    std::cout << "- Layers: " << cfg.num_layers << std::endl;
-    std::cout << "- Heads: " << cfg.num_heads << " (dim " << cfg.head_dim << ")" << std::endl;
-    std::cout << "- Routed Experts per layer: " << cfg.num_experts << " (active " << cfg.num_active_experts << ")" << std::endl;
-    std::cout << "- Shared Experts per layer: 1" << std::endl;
-    std::cout << "- Vocab Size: " << cfg.vocab_size << std::endl << std::endl;
-
     MoEModel model(cfg, model_dir);
 
     // 2. Load the base safetensors
     if (!model.load_base_model()) {
-        std::cerr << "[Error] Failed to load base weights from base.safetensors" << std::endl;
+        std::cerr << "[Error] Failed to load base weights" << std::endl;
         return 1;
     }
 
     // 3. Load the Tokenizer
-    std::cout << "\nLoading Tokenizer..." << std::endl;
     Tokenizer tokenizer;
     std::string vocab_path = model_dir + "/vocab.txt";
     if (!tokenizer.load(vocab_path)) {
-        std::cerr << "[Error] Failed to load vocabulary file: " << vocab_path << std::endl;
+        std::cerr << "[Error] Failed to load vocabulary file" << std::endl;
         return 1;
     }
 
     // 4. Prepare inference context
-    std::cout << "\nAllocating Inference Context..." << std::endl;
     InferenceContext ctx;
     ctx.resize(cfg);
 
@@ -64,40 +57,117 @@ int main(int argc, char* argv[]) {
         prompt = argv[2];
     }
     
-    std::cout << "\nEncoding Prompt: \"" << prompt << "\"" << std::endl;
-    std::vector<int> tokens = tokenizer.encode(prompt);
-    std::cout << "Tokens: ";
-    for (int t : tokens) {
-        std::cout << t << " ";
+    int max_tokens = 5;
+    if (argc > 3) {
+        max_tokens = std::stoi(argv[3]);
     }
-    std::cout << std::endl;
+    
+    std::vector<int> tokens = tokenizer.encode(prompt);
 
     // 6. Run generation loop
-    std::cout << "\nRunning Forward Pass..." << std::endl;
+    std::cout << "\nProcessing Prompt & Generating Output..." << std::endl;
     std::cout << "==================================================" << std::endl;
 
+    auto t_start = std::chrono::high_resolution_clock::now();
+
     int pos = 0;
+    std::vector<int> generated_tokens;
+
     // Process prompt tokens
     for (; pos < static_cast<int>(tokens.size()); ++pos) {
         int token_id = tokens[pos];
-        std::cout << "Processing token pos " << pos << " (ID: " << token_id << ")" << std::endl;
         model.forward(token_id, pos, ctx);
+        generated_tokens.push_back(token_id);
     }
 
-    // Generate the next token
-    // Find the argmax (index of highest logit value)
+    // Argmax for the very first token (with repetition penalty & BOS suppression)
     int next_token_id = 0;
-    float max_logit = ctx.logits[0];
-    for (int i = 1; i < cfg.vocab_size; ++i) {
-        if (ctx.logits[i] > max_logit) {
-            max_logit = ctx.logits[i];
+    float max_logit = -1e9f;
+    for (int i = 0; i < cfg.vocab_size; ++i) {
+        float logit = ctx.logits[i];
+        
+        // Suppress BOS token (3) during generation to avoid loop stutters
+        if (i == 3) {
+            logit = -1e9f;
+        }
+        
+        // Repetition penalty
+        for (int prev_id : generated_tokens) {
+            if (prev_id == i) {
+                logit = (logit > 0) ? (logit / 1.15f) : (logit * 1.15f);
+            }
+        }
+        
+        if (logit > max_logit) {
+            max_logit = logit;
             next_token_id = i;
         }
     }
 
-    std::cout << "\nPredicted Next Token ID: " << next_token_id << std::endl;
-    std::string next_word = tokenizer.decode(next_token_id);
-    std::cout << "Decoded Output Word: \"" << next_word << "\"" << std::endl;
+    auto t_first_token = std::chrono::high_resolution_clock::now();
+    double ttft_ms = std::chrono::duration<double, std::milli>(t_first_token - t_start).count();
+    std::cout << "\n[TTFT] Time to First Token: " << ttft_ms << " ms" << std::endl;
+
+    std::cout << "\nOutput: " << std::flush;
+    std::string word = tokenizer.decode(next_token_id);
+    std::cout << word << std::flush;
+    generated_tokens.push_back(next_token_id);
+
+    // Generate remaining tokens
+    int tokens_generated = 1;
+    auto t_gen_start = std::chrono::high_resolution_clock::now();
+
+    while (tokens_generated < max_tokens) {
+        // Forward pass with the newly predicted token
+        model.forward(next_token_id, pos, ctx);
+        pos++;
+
+        // Argmax with repetition penalty & BOS suppression
+        next_token_id = 0;
+        max_logit = -1e9f;
+        for (int i = 0; i < cfg.vocab_size; ++i) {
+            float logit = ctx.logits[i];
+            
+            // Suppress BOS token
+            if (i == 3) {
+                logit = -1e9f;
+            }
+            
+            // Repetition penalty
+            for (int prev_id : generated_tokens) {
+                if (prev_id == i) {
+                    logit = (logit > 0) ? (logit / 1.15f) : (logit * 1.15f);
+                }
+            }
+            
+            if (logit > max_logit) {
+                max_logit = logit;
+                next_token_id = i;
+            }
+        }
+
+        // Check for EOS tokens (typically 1 or 2)
+        if (next_token_id == 1 || next_token_id == 2) {
+            std::cout << " [EOS]" << std::endl;
+            break;
+        }
+
+        std::string next_word = tokenizer.decode(next_token_id);
+        std::cout << next_word << std::flush;
+        generated_tokens.push_back(next_token_id);
+        tokens_generated++;
+    }
+    std::cout << std::endl;
+
+    auto t_gen_end = std::chrono::high_resolution_clock::now();
+    double gen_time_sec = std::chrono::duration<double>(t_gen_end - t_gen_start).count();
+    double tokens_per_sec = (tokens_generated - 1) / gen_time_sec;
+
+    std::cout << "==================================================" << std::endl;
+    std::cout << "[Benchmark Summary]" << std::endl;
+    std::cout << "- TTFT (Prompt Processing): " << ttft_ms / 1000.0 << " sec" << std::endl;
+    std::cout << "- Generation Speed: " << tokens_per_sec << " tokens/sec" << std::endl;
+    std::cout << "- Generated Tokens: " << tokens_generated << std::endl;
     std::cout << "==================================================" << std::endl;
 
     return 0;
