@@ -229,7 +229,7 @@ for idx, filename in enumerate(raw_files):
         processed_keys = set()
         
         for name in keys:
-            if name == "__metadata__" or name in processed_keys or name.endswith(".scale"):
+            if name == "__metadata__" or name in processed_keys or name.endswith(".scale") or name.startswith("mtp."):
                 continue
                 
             # A. Process routed experts: layers.{L}.ffn.experts.{E}.{w_id}.weight
