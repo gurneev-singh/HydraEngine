@@ -5,6 +5,7 @@
 #include <cmath>
 #include <algorithm>
 #include <cstring>
+#include <set>
 
 // ----------------------------------------------------
 // InferenceContext Implementation
@@ -106,6 +107,21 @@ void MoEModel::forward(int token_id, int pos, InferenceContext& ctx) {
     const float* token_vector = embed_data + (token_id * hidden_dim);
     std::memcpy(ctx.hidden_state.data(), token_vector, hidden_dim * sizeof(float));
     
+    // Print first 5 floats of hidden state for embedding verification
+    std::cout << "[Debug Embed] Token " << token_id << " first 5 floats: ";
+    for (int i = 0; i < 5; ++i) {
+        std::cout << ctx.hidden_state[i] << " ";
+    }
+    std::cout << std::endl;
+    
+    // Debug embedding NaN
+    for (int i = 0; i < hidden_dim; ++i) {
+        if (std::isnan(ctx.hidden_state[i])) {
+            std::cout << "[Debug NaN] hidden_state is NaN right after embedding! token_id: " << token_id << std::endl;
+            return;
+        }
+    }
+    
     // 2. Loop over layers
     for (int l = 0; l < config.num_layers; ++l) {
         const auto& layer_w = layers[l];
@@ -118,23 +134,74 @@ void MoEModel::forward(int token_id, int pos, InferenceContext& ctx) {
                       static_cast<const float*>(layer_w.input_norm->data), 
                       config.hidden_dim, config.norm_epsilon);
                       
+        // Debug NaN after input norm
+        for (int i = 0; i < hidden_dim; ++i) {
+            if (std::isnan(ctx.norm_buffer[i])) {
+                std::cout << "[Debug NaN] Layer " << l << " norm_buffer is NaN after input_norm!" << std::endl;
+                return;
+            }
+        }
+                      
         // 1. Query projection
         // q_latent = norm_buffer * wq_a [q_lora_rank]
         ops::matmul(ctx.q_latent.data(), ctx.norm_buffer.data(), *layer_w.wq_a);
+        
+        // Debug NaN after wq_a matmul
+        for (int i = 0; i < config.q_lora_rank; ++i) {
+            if (std::isnan(ctx.q_latent[i])) {
+                std::cout << "[Debug NaN] Layer " << l << " q_latent is NaN after wq_a matmul!" << std::endl;
+                return;
+            }
+        }
+        
         // Normalize q_latent
         ops::rms_norm(ctx.q_latent.data(), ctx.q_latent.data(), 
                       static_cast<const float*>(layer_w.q_norm->data), 
                       config.q_lora_rank, config.norm_epsilon);
+        
+        // Debug NaN after q_norm
+        for (int i = 0; i < config.q_lora_rank; ++i) {
+            if (std::isnan(ctx.q_latent[i])) {
+                std::cout << "[Debug NaN] Layer " << l << " q_latent is NaN after q_norm!" << std::endl;
+                return;
+            }
+        }
+        
         // q = q_latent * wq_b [num_heads * head_dim]
         ops::matmul(ctx.q.data(), ctx.q_latent.data(), *layer_w.wq_b);
+        
+        // Debug NaN after wq_b matmul
+        for (int i = 0; i < config.num_heads * config.head_dim; ++i) {
+            if (std::isnan(ctx.q[i])) {
+                std::cout << "[Debug NaN] Layer " << l << " q is NaN after wq_b matmul!" << std::endl;
+                return;
+            }
+        }
         
         // 2. Key-Value projection
         // kv_latent = norm_buffer * wkv [kv_lora_rank]
         ops::matmul(ctx.kv_latent.data(), ctx.norm_buffer.data(), *layer_w.wkv);
+        
+        // Debug NaN after wkv matmul
+        for (int i = 0; i < config.kv_lora_rank; ++i) {
+            if (std::isnan(ctx.kv_latent[i])) {
+                std::cout << "[Debug NaN] Layer " << l << " kv_latent is NaN after wkv matmul!" << std::endl;
+                return;
+            }
+        }
+        
         // Normalize kv_latent
         ops::rms_norm(ctx.kv_latent.data(), ctx.kv_latent.data(), 
                       static_cast<const float*>(layer_w.kv_norm->data), 
                       config.kv_lora_rank, config.norm_epsilon);
+                      
+        // Debug NaN after kv_norm
+        for (int i = 0; i < config.kv_lora_rank; ++i) {
+            if (std::isnan(ctx.kv_latent[i])) {
+                std::cout << "[Debug NaN] Layer " << l << " kv_latent is NaN after kv_norm!" << std::endl;
+                return;
+            }
+        }
         
         // 3. Apply Decoupled RoPE
         // RoPE is applied to the last 64 elements of each head's query, and the last 64 of kv_latent
@@ -145,6 +212,20 @@ void MoEModel::forward(int token_id, int pos, InferenceContext& ctx) {
         
         float* kv_rope_ptr = ctx.kv_latent.data() + (config.head_dim - config.rope_head_dim);
         ops::rope(kv_rope_ptr, 1, config.rope_head_dim, pos, config.rope_theta);
+        
+        // Debug NaN after RoPE
+        for (int i = 0; i < config.num_heads * config.head_dim; ++i) {
+            if (std::isnan(ctx.q[i])) {
+                std::cout << "[Debug NaN] Layer " << l << " q is NaN after RoPE!" << std::endl;
+                return;
+            }
+        }
+        for (int i = 0; i < config.kv_lora_rank; ++i) {
+            if (std::isnan(ctx.kv_latent[i])) {
+                std::cout << "[Debug NaN] Layer " << l << " kv_latent is NaN after RoPE!" << std::endl;
+                return;
+            }
+        }
         
         // 4. Store KV latent state in Cache
         float* layer_cache_ptr = ctx.kv_cache[l].data() + (pos * config.head_dim);
@@ -183,6 +264,14 @@ void MoEModel::forward(int token_id, int pos, InferenceContext& ctx) {
             }
         }
         
+        // Debug NaN after attention aggregation
+        for (int i = 0; i < config.num_heads * config.head_dim; ++i) {
+            if (std::isnan(ctx.attn_out[i])) {
+                std::cout << "[Debug NaN] Layer " << l << " attn_out is NaN after attention scores!" << std::endl;
+                return;
+            }
+        }
+        
         // 6. Output Projection via Grouped Low-Rank
         // We have 8 groups. Each group projects 8 heads (8 * 512 = 4096 dims) to 1024 latent dims.
         std::vector<float> o_latent(8 * 1024, 0.0f);
@@ -210,9 +299,34 @@ void MoEModel::forward(int token_id, int pos, InferenceContext& ctx) {
             ops::matmul(group_out, group_in, wo_a_slice);
         }
         
+        // Debug NaN after wo_a matmuls
+        for (int i = 0; i < 8 * 1024; ++i) {
+            if (std::isnan(o_latent[i])) {
+                std::cout << "[Debug NaN] Layer " << l << " o_latent is NaN after wo_a projections!" << std::endl;
+                return;
+            }
+        }
+        
         // Project back to hidden_dim (4096) via wo_b
         ops::matmul(ctx.norm_buffer.data(), o_latent.data(), *layer_w.wo_b);
+        
+        // Debug NaN after wo_b matmul
+        for (int i = 0; i < config.hidden_dim; ++i) {
+            if (std::isnan(ctx.norm_buffer[i])) {
+                std::cout << "[Debug NaN] Layer " << l << " norm_buffer is NaN after wo_b matmul!" << std::endl;
+                return;
+            }
+        }
+        
         ops::vec_add(ctx.hidden_state.data(), ctx.norm_buffer.data(), config.hidden_dim);
+        
+        // Debug NaN after attention residual addition
+        for (int i = 0; i < config.hidden_dim; ++i) {
+            if (std::isnan(ctx.hidden_state[i])) {
+                std::cout << "[Debug NaN] Layer " << l << " hidden_state is NaN after attention residual addition!" << std::endl;
+                return;
+            }
+        }
         
         // ----------------------------------------------------
         // B. MoE MLP Block (Residual Connection)
@@ -222,17 +336,41 @@ void MoEModel::forward(int token_id, int pos, InferenceContext& ctx) {
                       static_cast<const float*>(layer_w.post_attention_norm->data), 
                       config.hidden_dim, config.norm_epsilon);
                       
+        // Debug NaN after post-attention norm
+        for (int i = 0; i < config.hidden_dim; ++i) {
+            if (std::isnan(ctx.norm_buffer[i])) {
+                std::cout << "[Debug NaN] Layer " << l << " norm_buffer is NaN after post_attention_norm!" << std::endl;
+                return;
+            }
+        }
+                      
         // Get logits from Router Gate: router_logits = norm_buffer * router_gate
         ops::matmul(ctx.router_logits.data(), ctx.norm_buffer.data(), *layer_w.router_gate);
         
-        // Convert router logits to probabilities
-        ops::softmax(ctx.router_logits.data(), config.num_experts);
+        // Debug NaN after router gate matmul
+        for (int i = 0; i < config.num_experts; ++i) {
+            if (std::isnan(ctx.router_logits[i])) {
+                std::cout << "[Debug NaN] Layer " << l << " router_logits is NaN after router_gate matmul!" << std::endl;
+                return;
+            }
+        }
         
-        // Select Top-K (config.num_active_experts) experts
+        // Compute affinity scores using stable SqrtSoftplus gating for DeepSeek-V4
         std::vector<std::pair<float, int>> expert_scores;
         for (int e = 0; e < config.num_experts; ++e) {
-            expert_scores.push_back({ctx.router_logits[e], e});
+            float z = ctx.router_logits[e];
+            float s = 0.0f;
+            if (z > 20.0f) {
+                s = std::sqrt(z);
+            } else if (z < -20.0f) {
+                s = 0.0f;
+            } else {
+                s = std::sqrt(std::log(1.0f + std::exp(z)));
+            }
+            expert_scores.push_back({s, e});
         }
+        
+        // Select Top-K (config.num_active_experts) experts
         std::sort(expert_scores.rbegin(), expert_scores.rend()); // Sort descending
         
         // Re-normalize active expert probabilities to sum to 1.0
@@ -240,13 +378,15 @@ void MoEModel::forward(int token_id, int pos, InferenceContext& ctx) {
         for (int k = 0; k < config.num_active_experts; ++k) {
             sum_probs += expert_scores[k].first;
         }
+        if (sum_probs == 0.0f) sum_probs = 1e-5f;
         
         // Clear layer FFN output accumulator
         std::fill(ctx.layer_mlp_out.begin(), ctx.layer_mlp_out.end(), 0.0f);
         
         // 1. Run 6 active routed experts
         for (int k = 0; k < config.num_active_experts; ++k) {
-            float route_prob = expert_scores[k].first / sum_probs;
+            // Apply normalized gate scaled by routed_scaling_factor (1.5)
+            float route_prob = 1.5f * (expert_scores[k].first / sum_probs);
             int expert_id = expert_scores[k].second;
             
             // Retrieve/page expert via LRU cache
@@ -255,10 +395,27 @@ void MoEModel::forward(int token_id, int pos, InferenceContext& ctx) {
             
             // Gate projection: gate_out = norm_buffer * gate_proj
             ops::matmul(ctx.expert_gate_out.data(), ctx.norm_buffer.data(), *expert->gate_proj);
+            
+            // Debug NaN after expert gate matmul
+            for (int i = 0; i < config.ffn_hidden_dim; ++i) {
+                if (std::isnan(ctx.expert_gate_out[i])) {
+                    std::cout << "[Debug NaN] Layer " << l << " Expert " << expert_id << " gate_out is NaN after gate matmul!" << std::endl;
+                    return;
+                }
+            }
+            
             ops::silu(ctx.expert_gate_out.data(), ctx.expert_gate_out.data(), config.ffn_hidden_dim);
             
             // Up projection: up_out = norm_buffer * up_proj
             ops::matmul(ctx.expert_up_out.data(), ctx.norm_buffer.data(), *expert->up_proj);
+            
+            // Debug NaN after expert up matmul
+            for (int i = 0; i < config.ffn_hidden_dim; ++i) {
+                if (std::isnan(ctx.expert_up_out[i])) {
+                    std::cout << "[Debug NaN] Layer " << l << " Expert " << expert_id << " up_out is NaN after up matmul!" << std::endl;
+                    return;
+                }
+            }
             
             // Activation gating: gate_out = gate_out * up_out
             ops::vec_mul(ctx.expert_gate_out.data(), ctx.expert_up_out.data(), config.ffn_hidden_dim);
@@ -266,19 +423,52 @@ void MoEModel::forward(int token_id, int pos, InferenceContext& ctx) {
             // Down projection: down_out = gate_out * down_proj
             ops::matmul(ctx.expert_down_out.data(), ctx.expert_gate_out.data(), *expert->down_proj);
             
+            // Debug NaN after expert down matmul
+            for (int i = 0; i < config.hidden_dim; ++i) {
+                if (std::isnan(ctx.expert_down_out[i])) {
+                    std::cout << "[Debug NaN] Layer " << l << " Expert " << expert_id << " down_out is NaN after down matmul!" << std::endl;
+                    return;
+                }
+            }
+            
             // Accumulate scaled expert output: layer_mlp_out += down_out * route_prob
             for (int d = 0; d < config.hidden_dim; ++d) {
                 ctx.layer_mlp_out[d] += ctx.expert_down_out[d] * route_prob;
             }
         }
         
+        // Debug NaN after routed experts accumulation
+        for (int i = 0; i < config.hidden_dim; ++i) {
+            if (std::isnan(ctx.layer_mlp_out[i])) {
+                std::cout << "[Debug NaN] Layer " << l << " layer_mlp_out is NaN after routed experts!" << std::endl;
+                return;
+            }
+        }
+        
         // 2. Run 1 always-active shared expert
         // Gate projection: shared_gate_out = norm_buffer * shared_gate
         ops::matmul(ctx.expert_gate_out.data(), ctx.norm_buffer.data(), *layer_w.shared_gate);
+        
+        // Debug NaN after shared gate matmul
+        for (int i = 0; i < config.ffn_hidden_dim; ++i) {
+            if (std::isnan(ctx.expert_gate_out[i])) {
+                std::cout << "[Debug NaN] Layer " << l << " shared_gate_out is NaN after gate matmul!" << std::endl;
+                return;
+            }
+        }
+        
         ops::silu(ctx.expert_gate_out.data(), ctx.expert_gate_out.data(), config.ffn_hidden_dim);
         
         // Up projection: shared_up_out = norm_buffer * shared_up
         ops::matmul(ctx.expert_up_out.data(), ctx.norm_buffer.data(), *layer_w.shared_up);
+        
+        // Debug NaN after shared up matmul
+        for (int i = 0; i < config.ffn_hidden_dim; ++i) {
+            if (std::isnan(ctx.expert_up_out[i])) {
+                std::cout << "[Debug NaN] Layer " << l << " shared_up_out is NaN after up matmul!" << std::endl;
+                return;
+            }
+        }
         
         // Activation gating: shared_gate_out = shared_gate_out * shared_up_out
         ops::vec_mul(ctx.expert_gate_out.data(), ctx.expert_up_out.data(), config.ffn_hidden_dim);
@@ -286,13 +476,37 @@ void MoEModel::forward(int token_id, int pos, InferenceContext& ctx) {
         // Down projection: shared_down_out = shared_gate_out * shared_down
         ops::matmul(ctx.expert_down_out.data(), ctx.expert_gate_out.data(), *layer_w.shared_down);
         
+        // Debug NaN after shared down matmul
+        for (int i = 0; i < config.hidden_dim; ++i) {
+            if (std::isnan(ctx.expert_down_out[i])) {
+                std::cout << "[Debug NaN] Layer " << l << " shared_down_out is NaN after down matmul!" << std::endl;
+                return;
+            }
+        }
+        
         // Accumulate shared expert output: layer_mlp_out += shared_down_out
         for (int d = 0; d < config.hidden_dim; ++d) {
             ctx.layer_mlp_out[d] += ctx.expert_down_out[d];
         }
         
+        // Debug NaN after total FFN accumulation
+        for (int i = 0; i < config.hidden_dim; ++i) {
+            if (std::isnan(ctx.layer_mlp_out[i])) {
+                std::cout << "[Debug NaN] Layer " << l << " layer_mlp_out is NaN after total FFN accumulation!" << std::endl;
+                return;
+            }
+        }
+        
         // Add FFN output back to hidden state (residual connection)
         ops::vec_add(ctx.hidden_state.data(), ctx.layer_mlp_out.data(), config.hidden_dim);
+        
+        // Debug NaN at end of layer
+        for (int i = 0; i < config.hidden_dim; ++i) {
+            if (std::isnan(ctx.hidden_state[i])) {
+                std::cout << "[Debug NaN] Layer " << l << " hidden_state is NaN at end of layer!" << std::endl;
+                return;
+            }
+        }
     }
     
     // 3. Final Output Projections
@@ -302,5 +516,202 @@ void MoEModel::forward(int token_id, int pos, InferenceContext& ctx) {
                   hidden_dim, config.norm_epsilon);
                   
     // Calculate vocabulary logits: logits = norm_buffer * lm_head
+    ops::matmul(ctx.logits.data(), ctx.norm_buffer.data(), *lm_head);
+}
+
+// ============================================================
+// Batched Prompt Processing
+// Processes ALL prompt tokens layer-by-layer instead of
+// token-by-token through all layers. This means experts for
+// each layer are loaded ONCE and reused for all tokens.
+// ============================================================
+void MoEModel::forward_batch(const std::vector<int>& token_ids, InferenceContext& ctx) {
+    int num_tokens = static_cast<int>(token_ids.size());
+    int hidden_dim = config.hidden_dim;
+    
+    // Allocate per-token hidden states
+    std::vector<std::vector<float>> batch_hidden(num_tokens, std::vector<float>(hidden_dim));
+    
+    // 1. Embedding lookup for ALL tokens
+    const float* embed_data = static_cast<const float*>(token_embeddings->data);
+    for (int t = 0; t < num_tokens; ++t) {
+        const float* token_vector = embed_data + (token_ids[t] * hidden_dim);
+        std::memcpy(batch_hidden[t].data(), token_vector, hidden_dim * sizeof(float));
+    }
+    
+    std::cout << "[Batch] Processing " << num_tokens << " prompt tokens layer-by-layer..." << std::endl;
+    
+    // 2. Process layer by layer
+    for (int l = 0; l < config.num_layers; ++l) {
+        const auto& layer_w = layers[l];
+        
+        // ------------------------------------------------
+        // A. Self-Attention Block (sequential per token for KV cache)
+        // ------------------------------------------------
+        for (int t = 0; t < num_tokens; ++t) {
+            int pos = t;
+            
+            // RMS norm
+            ops::rms_norm(ctx.norm_buffer.data(), batch_hidden[t].data(),
+                         static_cast<const float*>(layer_w.input_norm->data),
+                         hidden_dim, config.norm_epsilon);
+            
+            // Query projection
+            ops::matmul(ctx.q_latent.data(), ctx.norm_buffer.data(), *layer_w.wq_a);
+            ops::rms_norm(ctx.q_latent.data(), ctx.q_latent.data(),
+                         static_cast<const float*>(layer_w.q_norm->data),
+                         config.q_lora_rank, config.norm_epsilon);
+            ops::matmul(ctx.q.data(), ctx.q_latent.data(), *layer_w.wq_b);
+            
+            // KV projection
+            ops::matmul(ctx.kv_latent.data(), ctx.norm_buffer.data(), *layer_w.wkv);
+            ops::rms_norm(ctx.kv_latent.data(), ctx.kv_latent.data(),
+                         static_cast<const float*>(layer_w.kv_norm->data),
+                         config.kv_lora_rank, config.norm_epsilon);
+            
+            // RoPE
+            for (int h = 0; h < config.num_heads; ++h) {
+                float* head_q_rope = ctx.q.data() + (h * config.head_dim) + (config.head_dim - config.rope_head_dim);
+                ops::rope(head_q_rope, 1, config.rope_head_dim, pos, config.rope_theta);
+            }
+            float* kv_rope_ptr = ctx.kv_latent.data() + (config.head_dim - config.rope_head_dim);
+            ops::rope(kv_rope_ptr, 1, config.rope_head_dim, pos, config.rope_theta);
+            
+            // Store in KV cache
+            float* layer_cache_ptr = ctx.kv_cache[l].data() + (pos * config.head_dim);
+            std::memcpy(layer_cache_ptr, ctx.kv_latent.data(), config.head_dim * sizeof(float));
+            
+            // Compute attention
+            std::fill(ctx.attn_out.begin(), ctx.attn_out.end(), 0.0f);
+            float scale_factor = 1.0f / std::sqrt(static_cast<float>(config.head_dim));
+            for (int h = 0; h < config.num_heads; ++h) {
+                float* head_scores = ctx.attn_scores.data() + (h * config.max_seq_len);
+                const float* head_q = ctx.q.data() + (h * config.head_dim);
+                for (int p = 0; p <= pos; ++p) {
+                    const float* cached_kv = ctx.kv_cache[l].data() + (p * config.head_dim);
+                    float score = 0.0f;
+                    for (int d = 0; d < config.head_dim; ++d) score += head_q[d] * cached_kv[d];
+                    head_scores[p] = score * scale_factor;
+                }
+                ops::softmax(head_scores, pos + 1);
+                float* head_attn_out = ctx.attn_out.data() + (h * config.head_dim);
+                for (int p = 0; p <= pos; ++p) {
+                    float weight = head_scores[p];
+                    const float* cached_kv = ctx.kv_cache[l].data() + (p * config.head_dim);
+                    for (int d = 0; d < config.head_dim; ++d) head_attn_out[d] += weight * cached_kv[d];
+                }
+            }
+            
+            // Output projection via grouped low-rank
+            std::vector<float> o_latent(8 * 1024, 0.0f);
+            for (int g = 0; g < 8; ++g) {
+                float* group_in = ctx.attn_out.data() + (g * 8 * config.head_dim);
+                float* group_out = o_latent.data() + (g * 1024);
+                Tensor wo_a_slice = *layer_w.wo_a;
+                wo_a_slice.shape = {1024, 8 * config.head_dim};
+                size_t row_size_bytes = 0;
+                if (layer_w.wo_a->type == DataType::F32) {
+                    row_size_bytes = layer_w.wo_a->shape[1] * sizeof(float);
+                } else if (layer_w.wo_a->type == DataType::Q8_0) {
+                    row_size_bytes = (layer_w.wo_a->shape[1] / 32) * 36;
+                }
+                wo_a_slice.data = static_cast<char*>(layer_w.wo_a->data) + (g * 1024 * row_size_bytes);
+                ops::matmul(group_out, group_in, wo_a_slice);
+            }
+            ops::matmul(ctx.norm_buffer.data(), o_latent.data(), *layer_w.wo_b);
+            
+            // Residual add for attention
+            ops::vec_add(batch_hidden[t].data(), ctx.norm_buffer.data(), hidden_dim);
+        }
+        
+        // ------------------------------------------------
+        // B. MoE MLP Block — BATCHED expert loading
+        // ------------------------------------------------
+        // Step 1: Run router for ALL tokens, collect unique expert IDs
+        std::vector<std::vector<std::pair<float, int>>> all_expert_selections(num_tokens);
+        std::set<int> unique_experts_needed;
+        std::vector<std::vector<float>> batch_norm(num_tokens, std::vector<float>(hidden_dim));
+        
+        for (int t = 0; t < num_tokens; ++t) {
+            ops::rms_norm(batch_norm[t].data(), batch_hidden[t].data(),
+                         static_cast<const float*>(layer_w.post_attention_norm->data),
+                         hidden_dim, config.norm_epsilon);
+            
+            ops::matmul(ctx.router_logits.data(), batch_norm[t].data(), *layer_w.router_gate);
+            
+            // Compute affinity scores using stable SqrtSoftplus gating for DeepSeek-V4
+            std::vector<std::pair<float, int>> expert_scores;
+            for (int e = 0; e < config.num_experts; ++e) {
+                float z = ctx.router_logits[e];
+                float s = 0.0f;
+                if (z > 20.0f) {
+                    s = std::sqrt(z);
+                } else if (z < -20.0f) {
+                    s = 0.0f;
+                } else {
+                    s = std::sqrt(std::log(1.0f + std::exp(z)));
+                }
+                expert_scores.push_back({s, e});
+            }
+            
+            std::sort(expert_scores.rbegin(), expert_scores.rend());
+            
+            for (int k = 0; k < config.num_active_experts; ++k) {
+                unique_experts_needed.insert(expert_scores[k].second);
+            }
+            all_expert_selections[t] = std::move(expert_scores);
+        }
+        
+        // Step 2: Prefetch ALL unique experts for this layer at once
+        for (int eid : unique_experts_needed) {
+            expert_cache->get_expert(l, eid);
+        }
+        
+        // Step 3: Run expert computations for each token (all experts already cached)
+        for (int t = 0; t < num_tokens; ++t) {
+            const auto& expert_scores = all_expert_selections[t];
+            float sum_probs = 0.0f;
+            for (int k = 0; k < config.num_active_experts; ++k) sum_probs += expert_scores[k].first;
+            if (sum_probs == 0.0f) sum_probs = 1e-5f;
+            
+            std::fill(ctx.layer_mlp_out.begin(), ctx.layer_mlp_out.end(), 0.0f);
+            
+            // Routed experts
+            for (int k = 0; k < config.num_active_experts; ++k) {
+                // Apply normalized gate scaled by routed_scaling_factor (1.5)
+                float route_prob = 1.5f * (expert_scores[k].first / sum_probs);
+                int expert_id = expert_scores[k].second;
+                auto expert = expert_cache->get_expert(l, expert_id);
+                if (!expert) continue;
+                
+                ops::matmul(ctx.expert_gate_out.data(), batch_norm[t].data(), *expert->gate_proj);
+                ops::silu(ctx.expert_gate_out.data(), ctx.expert_gate_out.data(), config.ffn_hidden_dim);
+                ops::matmul(ctx.expert_up_out.data(), batch_norm[t].data(), *expert->up_proj);
+                ops::vec_mul(ctx.expert_gate_out.data(), ctx.expert_up_out.data(), config.ffn_hidden_dim);
+                ops::matmul(ctx.expert_down_out.data(), ctx.expert_gate_out.data(), *expert->down_proj);
+                
+                for (int d = 0; d < hidden_dim; ++d) ctx.layer_mlp_out[d] += ctx.expert_down_out[d] * route_prob;
+            }
+            
+            // Shared expert
+            ops::matmul(ctx.expert_gate_out.data(), batch_norm[t].data(), *layer_w.shared_gate);
+            ops::silu(ctx.expert_gate_out.data(), ctx.expert_gate_out.data(), config.ffn_hidden_dim);
+            ops::matmul(ctx.expert_up_out.data(), batch_norm[t].data(), *layer_w.shared_up);
+            ops::vec_mul(ctx.expert_gate_out.data(), ctx.expert_up_out.data(), config.ffn_hidden_dim);
+            ops::matmul(ctx.expert_down_out.data(), ctx.expert_gate_out.data(), *layer_w.shared_down);
+            for (int d = 0; d < hidden_dim; ++d) ctx.layer_mlp_out[d] += ctx.expert_down_out[d];
+            
+            // Residual add for MoE
+            ops::vec_add(batch_hidden[t].data(), ctx.layer_mlp_out.data(), hidden_dim);
+        }
+        
+        std::cout << "[Batch] Layer " << l << "/" << config.num_layers << " done. Unique experts: " << unique_experts_needed.size() << std::endl;
+    }
+    
+    // 3. Final output: only compute logits for the LAST token
+    std::memcpy(ctx.hidden_state.data(), batch_hidden[num_tokens - 1].data(), hidden_dim * sizeof(float));
+    ops::rms_norm(ctx.norm_buffer.data(), ctx.hidden_state.data(),
+                 static_cast<const float*>(output_norm->data),
+                 hidden_dim, config.norm_epsilon);
     ops::matmul(ctx.logits.data(), ctx.norm_buffer.data(), *lm_head);
 }
